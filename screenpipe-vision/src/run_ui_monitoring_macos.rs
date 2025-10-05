@@ -1,9 +1,9 @@
 use crate::UIFrame;
 use anyhow::Result;
-use tracing::{debug, error, info, warn};
 use screenpipe_events::send_event;
 use std::fs;
 use std::io;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
@@ -13,9 +13,17 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::signal;
 use tokio::time::{sleep, timeout, Duration};
+use tracing::{debug, error, info, warn};
 use which::which;
 
 pub async fn run_ui() -> Result<()> {
+    // Background UI monitoring is disabled by default for performance
+    // Enable it with SCREENPIPE_ENABLE_BACKGROUND_UI=1
+    if std::env::var("SCREENPIPE_ENABLE_BACKGROUND_UI").is_err() {
+        info!("background UI monitoring disabled by default (set SCREENPIPE_ENABLE_BACKGROUND_UI=1 to enable)");
+        return Ok(());
+    }
+
     info!("starting ui monitoring service...");
 
     let binary_name = "ui_monitor";
@@ -151,6 +159,8 @@ pub async fn run_ui() -> Result<()> {
     });
 
     let named_pipe_clone = named_pipe.clone();
+    let mut backoff_seconds = 5u64;
+    let mut consecutive_sigkills = 0u32;
 
     while is_running.load(std::sync::atomic::Ordering::Relaxed) {
         // Clone the PathBuf for each iteration
@@ -196,13 +206,31 @@ pub async fn run_ui() -> Result<()> {
         match child.wait().await {
             Ok(status) => {
                 warn!("ui_monitor exited with status: {}", status);
-                warn!("restarting ui_monitor in 5 seconds...");
-                sleep(Duration::from_secs(5)).await;
+
+                // Check if it was SIGKILL (signal 9)
+                let is_sigkill = status.code().is_none() && status.signal() == Some(9);
+
+                if is_sigkill {
+                    consecutive_sigkills += 1;
+                    // Exponential backoff: 5s, 10s, 20s, 40s, 60s max
+                    backoff_seconds =
+                        std::cmp::min(5 * 2_u64.pow(std::cmp::min(consecutive_sigkills, 4)), 60);
+                    warn!("ui_monitor killed by SIGKILL ({} consecutive), restarting in {} seconds...", consecutive_sigkills, backoff_seconds);
+                } else {
+                    // Reset backoff on normal exit
+                    consecutive_sigkills = 0;
+                    backoff_seconds = 5;
+                    warn!("restarting ui_monitor in {} seconds...", backoff_seconds);
+                }
+
+                sleep(Duration::from_secs(backoff_seconds)).await;
             }
             Err(e) => {
                 error!("failed to wait for ui_monitor process: {}", e);
-                warn!("retrying ui_monitor in 5 seconds...");
-                sleep(Duration::from_secs(5)).await;
+                consecutive_sigkills = 0;
+                backoff_seconds = 5;
+                warn!("retrying ui_monitor in {} seconds...", backoff_seconds);
+                sleep(Duration::from_secs(backoff_seconds)).await;
             }
         }
     }

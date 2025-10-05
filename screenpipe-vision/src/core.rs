@@ -3,6 +3,8 @@ use crate::apple::perform_ocr_apple;
 use crate::capture_screenshot_by_window::CapturedWindow;
 use crate::capture_screenshot_by_window::WindowFilters;
 use crate::custom_ocr::perform_ocr_custom;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::get_live_accessibility_text;
 #[cfg(target_os = "windows")]
 use crate::microsoft::perform_ocr_windows;
 use crate::monitor::get_monitor_by_id;
@@ -28,7 +30,8 @@ use std::{
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, error, warn};
+use tokio::time::{interval as tokio_interval, MissedTickBehavior};
+use tracing::{debug, error, info, warn};
 
 use crate::browser_utils::create_url_detector;
 
@@ -100,11 +103,20 @@ where
     Ok(Instant::now() - Duration::from_millis(millis as u64))
 }
 
+#[derive(Debug, Clone)]
+pub struct UiSnapshot {
+    pub app: String,
+    pub window: String,
+    pub text: String,
+    pub captured_at: Instant,
+}
+
 pub struct CaptureResult {
     pub image: DynamicImage,
     pub frame_number: u64,
     pub timestamp: Instant,
     pub window_ocr_results: Vec<WindowOcrResult>,
+    pub ui_snapshot: Option<UiSnapshot>,
 }
 
 pub struct WindowOcrResult {
@@ -154,9 +166,8 @@ pub async fn continuous_capture(
     capture_unfocused_windows: bool,
 ) -> Result<(), ContinuousCaptureError> {
     let mut frame_counter: u64 = 0;
-    let mut previous_image: Option<DynamicImage> = None;
-    let mut max_average: Option<MaxAverageFrame> = None;
-    let mut max_avg_value = 0.0;
+    let mut previous_image: Option<DynamicImage> = None; // retained for potential future use
+    let mut last_tick = Instant::now();
 
     debug!(
         "continuous_capture: Starting using monitor: {:?}",
@@ -171,8 +182,17 @@ pub async fn continuous_capture(
         }
     };
 
+    // tick-based scheduler to minimize drift
+    let mut ticker = tokio_interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
+        ticker.tick().await;
+        let tick_start = Instant::now();
+        let since_last_ms = tick_start.saturating_duration_since(last_tick).as_millis();
+
         // 3. Capture screenshot
+        let cap_start = Instant::now();
         let capture_result =
             match capture_screenshot(&monitor, &window_filters, capture_unfocused_windows).await {
                 Ok(result) => result,
@@ -183,43 +203,31 @@ pub async fn continuous_capture(
                     ));
                 }
             };
+        let cap_ms = cap_start.elapsed().as_millis();
 
         // 4. Process captured image
         let (image, window_images, image_hash, _capture_duration) = capture_result;
 
-        let should_skip = should_skip_frame(
-            &previous_image,
-            &image,
-            &mut max_average,
-            frame_counter,
-            &mut max_avg_value,
-            &window_images,
-            image_hash,
-            result_tx.clone(),
-        )
-        .await;
-
-        if should_skip {
-            frame_counter += 1;
-            tokio::time::sleep(interval).await;
-            continue;
-        }
-
-        previous_image = Some(image);
-
-        // 5. Process max average frame if available
-        if let Some(max_avg_frame) = max_average.take() {
-            if let Err(e) =
-                process_max_average_frame(max_avg_frame, &ocr_engine, languages.clone()).await
-            {
-                error!("Error processing max average frame: {}", e);
+        // Always process the current frame (baseline 1 frame per tick)
+        previous_image = Some(image.clone());
+        let ocr_engine_owned = ocr_engine.clone();
+        let languages_owned = languages.clone();
+        let result_tx_owned = result_tx.clone();
+        let ocr_task = OcrTaskData {
+            image,
+            window_images,
+            frame_number: frame_counter,
+            timestamp: tick_start,
+            result_tx: result_tx_owned,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = process_ocr_task(ocr_task, &ocr_engine_owned, languages_owned).await {
+                error!("Error processing OCR task: {}", e);
             }
-            frame_counter = 0;
-            max_avg_value = 0.0;
-        }
+        });
 
         frame_counter += 1;
-        tokio::time::sleep(interval).await;
+        last_tick = tick_start;
     }
 }
 
@@ -255,7 +263,7 @@ async fn should_skip_frame(
         current_average
     };
 
-    if current_average < 0.006 {
+    if current_average < 0.0 {
         debug!(
             "Skipping frame {} due to low average difference: {:.3}",
             frame_counter, current_average
@@ -332,7 +340,24 @@ pub async fn process_ocr_task(
     let mut total_confidence = 0.0;
     let mut window_count = 0;
 
-    for captured_window in window_images {
+    let ui_snapshot = capture_live_ui_snapshot(&window_images);
+
+    // Only process focused window(s) to ensure OCR aligns with the desktop video content.
+    let focused_only: Vec<CapturedWindow> = window_images
+        .iter()
+        .filter(|w| w.is_focused)
+        .cloned()
+        .collect();
+    let windows_to_process: Vec<CapturedWindow> = if focused_only.is_empty() {
+        // Fallback: if focus state is unavailable, process all as before
+        // (better to keep data than drop everything)
+        // This still allows upstream filters to prefer focused frames.
+        window_images.clone()
+    } else {
+        focused_only
+    };
+
+    for captured_window in windows_to_process {
         let ocr_result = process_window_ocr(
             captured_window,
             ocr_engine,
@@ -352,6 +377,7 @@ pub async fn process_ocr_task(
         frame_number,
         timestamp,
         window_ocr_results,
+        ui_snapshot,
     };
 
     send_ocr_result(&result_tx, capture_result)
@@ -362,6 +388,82 @@ pub async fn process_ocr_task(
     log_ocr_performance(start_time, window_count, total_confidence, frame_number);
 
     Ok(())
+}
+
+fn capture_live_ui_snapshot(window_images: &[CapturedWindow]) -> Option<UiSnapshot> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        if window_images.is_empty() {
+            info!("ui snapshot skipped: no windows captured");
+            return None;
+        }
+
+        let primary_window = match window_images
+            .iter()
+            .find(|w| w.is_focused)
+            .or_else(|| window_images.first())
+        {
+            Some(win) => win,
+            None => {
+                info!("ui snapshot skipped: no primary window identified");
+                return None;
+            }
+        };
+
+        let expected_app = primary_window.app_name.to_lowercase();
+        let expected_window = primary_window.window_name.to_lowercase();
+        info!(
+            "ui snapshot attempting capture for app={} window={}",
+            expected_app, expected_window
+        );
+        match get_live_accessibility_text() {
+            Some((app, window, text)) => {
+                let app_lower = app.to_lowercase();
+                let window_lower = window.to_lowercase();
+                let text_len = text.trim().len();
+
+                if text.trim().is_empty() {
+                    info!(
+                        "ui snapshot empty result for app={} window={} (expected app={} window={})",
+                        app_lower, window_lower, expected_app, expected_window
+                    );
+                    return None;
+                }
+
+                if app_lower != expected_app || window_lower != expected_window {
+                    info!(
+                        "ui snapshot mismatch: expected {}:{}, got {}:{}, len={}",
+                        expected_app, expected_window, app_lower, window_lower, text_len
+                    );
+                    return None;
+                }
+
+                info!(
+                    "ui snapshot captured for app={} window={} len={}",
+                    app_lower, window_lower, text_len
+                );
+                return Some(UiSnapshot {
+                    app: app_lower,
+                    window: window_lower,
+                    text,
+                    captured_at: Instant::now(),
+                });
+            }
+            None => {
+                info!(
+                    "ui snapshot unavailable for app={} window={}",
+                    expected_app, expected_window
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = window_images;
+        None
+    }
 }
 
 async fn process_window_ocr(
@@ -578,7 +680,11 @@ impl UIFrame {
     }
 }
 
-fn get_active_browser_url_sync(app_name: &str, process_id: i32, window_title: &str) -> Result<String, std::io::Error> {
+fn get_active_browser_url_sync(
+    app_name: &str,
+    process_id: i32,
+    window_title: &str,
+) -> Result<String, std::io::Error> {
     let detector = create_url_detector();
     match detector.get_active_url(app_name, process_id, window_title) {
         Ok(Some(url)) => Ok(url),

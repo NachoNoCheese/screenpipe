@@ -73,6 +73,8 @@ var currentObserver: AXObserver? {
 var monitoringEventLoop: CFRunLoop?
 var hasChanges = false
 var windowsNeedingTimestampUpdate = Set<WindowIdentifier>()
+var snapshotMode = false
+var snapshotDeadline: DispatchTime? = nil
 // Debounce mechanism variables
 var pendingNotifications = [(startElement: AXUIElement, depth: Int)]()
 var debounceTimer: DispatchSourceTimer?
@@ -157,7 +159,9 @@ struct ElementAttributes {
 // Add traversal state management
 var isTraversing = false
 var shouldCancelTraversal = false
-let traversalQueue = DispatchQueue(label: "com.screenpipe.traversal")
+let traversalQueue = DispatchQueue(label: "com.screenpipe.traversal", qos: .utility)
+// Snapshot coordination: optional completion callback invoked when traversal finishes
+var snapshotCompletion: (() -> Void)? = nil
 
 // Add ScreenPipeDB instance
 var screenPipeDb: ScreenPipeDB?
@@ -379,9 +383,11 @@ func monitorCurrentFrontmostApplication() {
     // Get window name BEFORE initializing structures
     var windowName = "unknown window"
     var windowValue: AnyObject?
+    var focusedWindowElement: AXUIElement? = nil
     let result = AXUIElementCopyAttributeValue(
         axApp, kAXFocusedWindowAttribute as CFString, &windowValue)
     if result == .success, let window = windowValue as! AXUIElement? {
+        focusedWindowElement = window
         if let titleValue = getAttributeValue(window, forAttribute: kAXTitleAttribute) as? String {
             // Sanitize window name immediately when we get it
             windowName = titleValue.lowercased()
@@ -407,7 +413,9 @@ func monitorCurrentFrontmostApplication() {
     if !windowExists || !isWindowRecent {
         // Only traverse if window doesn't exist or data is old
         print("traversing ui elements for \(appName), window: \(windowName)...")
-        traverseAndStoreUIElements(axApp, appName: appName, windowName: windowName)
+        // Prefer traversing the focused window subtree; fallback to app root
+        let rootForTraversal: AXUIElement = focusedWindowElement ?? axApp
+        traverseAndStoreUIElements(rootForTraversal, appName: appName, windowName: windowName)
         hasChanges = true
     } else {
         print("reusing existing ui elements for \(appName), window: \(windowName)...")
@@ -465,11 +473,13 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
 
         let startTime = DispatchTime.now()
         var visitedElements = Set<AXUIElementWrapper>()
+        var attrCache = [AXUIElementWrapper: [String: AnyObject]]()
         let unwantedValues = ["0", "", "\u{200E}", "3", "\u{200F}"]  // LRM and RLM marks
         let unwantedLabels = [
-            "window", "application", "group", "button", "image", "text",
-            "pop up button", "region", "notifications", "table", "column",
-            "html content",
+            "window", "application", "group", "button", "image",
+            "pop up button", "region", "notifications", "table", "column"
+            // Note: do not treat web content/scroll containers as unwanted labels
+            // Note: removed "button" and "text" to capture email addresses and text content
         ]
         let attributesToCheck = [
             "AXDescription", "AXValue", "AXLabel", "AXRoleDescription", "AXHelp",
@@ -477,26 +487,46 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
 
         // Add character count tracking
         var totalCharacterCount = 0
+        var visitedNodes = 0
+        let nodeVisitLimit = snapshotMode ? 3000 : 3000
 
-        func traverse(_ element: AXUIElement, depth: Int) -> ElementAttributes? {
+        func cachedAttr(_ element: AXUIElement, _ attribute: String) -> AnyObject? {
+            let key = AXUIElementWrapper(element: element)
+            if let attrs = attrCache[key], let v = attrs[attribute] { return v }
+            if let v = getAttributeValue(element, forAttribute: attribute) {
+                if attrCache[key] == nil { attrCache[key] = [:] }
+                attrCache[key]![attribute] = v
+                return v
+            }
+            return nil
+        }
+
+        func timeRemainingMs() -> Int {
+            if let deadline = snapshotDeadline {
+                let now = DispatchTime.now()
+                if now >= deadline { return 0 }
+                let delta = deadline.uptimeNanoseconds &- now.uptimeNanoseconds
+                return Int(delta / 1_000_000)
+            }
+            return Int.max
+        }
+
+        func traverse(_ element: AXUIElement, depth: Int, parentPath: String, windowRect: CGRect) -> ElementAttributes? {
+            // Respect snapshot time budget aggressively
+            if let deadline = snapshotDeadline, DispatchTime.now() >= deadline {
+                shouldCancelTraversal = true
+                return nil
+            }
+            if visitedNodes >= nodeVisitLimit { shouldCancelTraversal = true; return nil }
             // Add check for AXMenuBar at the start
-            if let role = getAttributeValue(element, forAttribute: "AXRole") as? String,
-                role == "AXMenuBar"
-            {
-                return nil
-            }
+            if let role = cachedAttr(element, "AXRole") as? String,
+                role == "AXMenuBar" { return nil }
 
-            // Add depth limit check
-            if depth > 100 {
-                print("max depth reached: depth=\(depth), app=\(appName), window=\(windowName)")
-                return nil
-            }
+            // Depth limit with exceptions for scroll/web/document containers
+            // Moved after role detection to allow contextual relaxation
 
-            // Check for cancellation or character limit
-            if shouldCancelTraversal || totalCharacterCount >= 100_000 {
-                if totalCharacterCount >= 1_000_000 {
-                    print("hit 1mln char limit for app: \(appName), window: \(windowName)")
-                }
+            // Check for cancellation or character limit (increased for better content capture)
+            if shouldCancelTraversal || totalCharacterCount >= 50_000 {
                 return nil
             }
 
@@ -505,18 +535,30 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
             guard !visitedElements.contains(elementWrapper) else { return nil }
             visitedElements.insert(elementWrapper)
 
-            var attributeNames: CFArray?
-            let result = AXUIElementCopyAttributeNames(element, &attributeNames)
-
-            guard result == .success, let attributes = attributeNames as? [String] else {
+            // Basic visibility/role pruning
+            if let hiddenNum = cachedAttr(element, kAXHiddenAttribute as String) as? NSNumber, hiddenNum.boolValue {
                 return nil
             }
+            let role = (cachedAttr(element, "AXRole") as? String) ?? "Unknown"
+            let roleLower = role.lowercased()
+            let skipBranchRoles: Set<String> = [
+                "AXMenuBar", "AXMenu", "AXMenuItem", "AXDock", "AXDockItem", "AXToolbar", "AXStatusBar"
+            ]
+            if skipBranchRoles.contains(role) { return nil }
+
+            // Compute effective depth limit now that we know the role/context
+            let baseDepthLimit = snapshotMode ? 10 : 10
+            var effectiveDepthLimit = baseDepthLimit
+            if roleLower.contains("scroll") || roleLower.contains("webarea") || roleLower.contains("textarea") || roleLower.contains("document") {
+                effectiveDepthLimit = baseDepthLimit + 4
+            }
+            if depth > effectiveDepthLimit { return nil }
 
             var position: CGPoint = .zero
             var size: CGSize = .zero
 
             // Get position
-            if let positionValue = getAttributeValue(element, forAttribute: kAXPositionAttribute)
+            if let positionValue = cachedAttr(element, kAXPositionAttribute as String)
                 as! AXValue?,
                 AXValueGetType(positionValue) == .cgPoint
             {
@@ -524,19 +566,48 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
             }
 
             // Get size
-            if let sizeValue = getAttributeValue(element, forAttribute: kAXSizeAttribute)
+            if let sizeValue = cachedAttr(element, kAXSizeAttribute as String)
                 as! AXValue?,
                 AXValueGetType(sizeValue) == .cgSize
             {
                 AXValueGetValue(sizeValue, .cgSize, &size)
             }
 
-            // Get element description
-            let elementDesc =
-                (getAttributeValue(element, forAttribute: "AXRole") as? String) ?? "Unknown"
+            // Skip nodes clearly outside of window bounds to reduce work
+            if size.width > 0 && size.height > 0 {
+                let elRect = CGRect(x: position.x, y: position.y, width: size.width, height: size.height)
+                if !windowRect.intersects(elRect) {
+                    return nil
+                }
+            }
 
-            // Get path
-            let (path, depth) = getElementPath(element)
+            let title = (cachedAttr(element, kAXTitleAttribute as String) as? String)
+            var elementDesc = role
+            if let t = title, !t.isEmpty { elementDesc += "[\(t)]" }
+            let path = parentPath.isEmpty ? elementDesc : parentPath + " -> " + elementDesc
+            
+            // Debug: Log elements that might contain email addresses
+            if let title = title, title.contains("@") {
+                print("DEBUG: Found element with email in title: role=\(role), title=\(title), depth=\(depth)")
+            }
+            if let value = cachedAttr(element, kAXValueAttribute as String) as? String, value.contains("@") {
+                print("DEBUG: Found element with email in value: role=\(role), value=\(value), depth=\(depth)")
+            }
+            
+            // Debug: Log To field elements specifically
+            if let title = title, title.lowercased().contains("to recipients") {
+                print("DEBUG: Found To Recipients element: role=\(role), title=\(title), depth=\(depth)")
+            }
+            if let value = cachedAttr(element, kAXValueAttribute as String) as? String, value.lowercased().contains("to recipients") {
+                print("DEBUG: Found To Recipients element by value: role=\(role), value=\(value), depth=\(depth)")
+            }
+            
+            // Debug: Log all elements with AXStaticText role to see what's being processed
+            if role == "AXStaticText" {
+                let titleStr = title ?? "nil"
+                let valueStr = (cachedAttr(element, kAXValueAttribute as String) as? String) ?? "nil"
+                print("DEBUG: AXStaticText element - title=\(titleStr), value=\(valueStr), depth=\(depth)")
+            }
 
             var elementAttributes = ElementAttributes(
                 element: elementDesc,
@@ -553,41 +624,149 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
 
             var hasRelevantValue = false
 
-            for attr in attributes {
-                // Check relevant attributes
-                if attributesToCheck.contains(attr) {
-                    if let value = getAttributeValue(element, forAttribute: attr) {
-                        let valueStr = describeValue(value)
-                        if !valueStr.isEmpty && !unwantedValues.contains(valueStr)
-                            && valueStr.count > 1 && !unwantedLabels.contains(valueStr.lowercased())
-                        {
-                            // Store attribute and its value
-                            elementAttributes.attributes[attr] = valueStr
-                            hasRelevantValue = true
+            // Prefer a single meaningful value quickly
+            let prioritized: [String] = [
+                kAXValueAttribute as String,
+                kAXTitleAttribute as String,
+                kAXDescriptionAttribute as String,
+                "AXLabel",
+                kAXHelpAttribute as String,
+                kAXRoleDescriptionAttribute as String,
+                // For compose fields like To/Subject sometimes only placeholder/value are set
+                "AXSelectedText",
+                "AXPlaceholderValue",
+            ]
+            for attr in prioritized {
+                var maybeString: String? = nil
+                if attr == (kAXTitleAttribute as String) {
+                    maybeString = title
+                } else if let v = cachedAttr(element, attr) {
+                    maybeString = describeValue(v)
+                }
+                if let s = maybeString, !s.isEmpty, !unwantedValues.contains(s), s.count > 1,
+                    !unwantedLabels.contains(s.lowercased())
+                {
+                    elementAttributes.attributes[attr] = s
+                    hasRelevantValue = true
+                    // Removed break to capture all valid attributes, not just the first one
+                }
+            }
+
+            visitedNodes += 1
+
+            // Traverse child elements (breadth-restricted; adaptive in snapshot mode)
+            var childrenElements: [ElementAttributes] = []
+            var traversedChildren = 0
+
+            // Prefer visible children when available, otherwise fall back to kAXChildren
+            var childArray: [AXUIElement] = []
+            if let visible = cachedAttr(element, "AXVisibleChildren") as? [AXUIElement] {
+                childArray = visible
+            } else if let all = cachedAttr(element, kAXChildrenAttribute as String) as? [AXUIElement] {
+                childArray = all
+            }
+
+            // Helper: identify scroll-like containers, including groups with scrollers/contents
+            func isScrollLikeContainer(_ roleLower: String, _ element: AXUIElement) -> Bool {
+                if roleLower.contains("scrollarea") || roleLower.contains("scroll view") || roleLower.contains("webarea") {
+                    return true
+                }
+                if let _ = cachedAttr(element, "AXContents") as? [AXUIElement] { return true }
+                if let _ = cachedAttr(element, "AXHorizontalScrollBar") as! AXUIElement? { return true }
+                if let _ = cachedAttr(element, "AXVerticalScrollBar") as! AXUIElement? { return true }
+                if let scrollable = cachedAttr(element, "AXScrollable") as? NSNumber, scrollable.boolValue { return true }
+                return false
+            }
+
+            // Scroll container support: include AXContents and ensure we don't stop at scrollbars-only
+            let isScrollContainer = isScrollLikeContainer(roleLower, element)
+            if isScrollContainer {
+                var seen = Set<AXUIElementWrapper>()
+                childArray.forEach { seen.insert(AXUIElementWrapper(element: $0)) }
+
+                // Merge AXContents if present
+                if let contents = cachedAttr(element, "AXContents") as? [AXUIElement] {
+                    for c in contents {
+                        let wrap = AXUIElementWrapper(element: c)
+                        if !seen.contains(wrap) { childArray.append(c); seen.insert(wrap) }
+                    }
+                }
+
+                // If visible children were only scrollbars, also merge full children
+                let nonScrollbarChildren = childArray.filter {
+                    let r = (cachedAttr($0, "AXRole") as? String) ?? ""
+                    return !r.lowercased().contains("scrollbar")
+                }
+                if nonScrollbarChildren.isEmpty {
+                    if let all = cachedAttr(element, kAXChildrenAttribute as String) as? [AXUIElement] {
+                        for c in all {
+                            let wrap = AXUIElementWrapper(element: c)
+                            if !seen.contains(wrap) { childArray.append(c); seen.insert(wrap) }
                         }
                     }
                 }
             }
 
-            // Traverse child elements
-            var childrenElements: [ElementAttributes] = []
-            for attr in attributes {
-                if let childrenValue = getAttributeValue(element, forAttribute: attr) {
-                    // Check if it's an array of AXUIElements first
-                    if let elementArray = childrenValue as? [AXUIElement] {
-                        if elementArray.count > 1000 {
-                            print("element at path \(path) has \(elementArray.count) children")
-                        }
-                        for childElement in elementArray {
-                            if let childAttributes = traverse(childElement, depth: depth + 1) {
-                                childrenElements.append(childAttributes)
-                            }
-                        }
-                    } else if let childElement = childrenValue as! AXUIElement? {
-                        if let childAttributes = traverse(childElement, depth: depth + 1) {
-                            childrenElements.append(childAttributes)
-                        }
+            if childArray.count > 50 {
+                print("element at path \(path) has \(childArray.count) children")
+            }
+
+            // If this element is a leaf-like role, avoid recursing into children
+            let leafRoles: Set<String> = [
+                // Do not treat AXTextArea as leaf; Outlook compose body often nests content
+                // Note: removed "AXStaticText" and "AXTextField" to allow traversal into text elements that might contain email addresses
+                "AXLink", "AXButton", "AXImage", "AXCheckBox", "AXRadioButton"
+            ]
+            let shouldRecurse = !leafRoles.contains(role)
+
+            // Determine if this branch is content-heavy (prioritize in snapshot mode)
+            let isPriorityBranch = snapshotMode && (
+                elementAttributes.path.localizedCaseInsensitiveContains("message header details") ||
+                elementAttributes.path.localizedCaseInsensitiveContains("reading pane") ||
+                elementAttributes.attributes.values.contains { $0.localizedCaseInsensitiveContains("reading pane") || $0.localizedCaseInsensitiveContains("message header details") } ||
+                roleLower.contains("webarea") || roleLower.contains("textarea") || roleLower.contains("document") ||
+                isScrollContainer
+            )
+
+            // In snapshot mode, order children by a quick heuristic to surface content early
+            if snapshotMode && childArray.count > 1 {
+                var priority: [AXUIElement] = []
+                var others: [AXUIElement] = []
+                priority.reserveCapacity(childArray.count)
+                others.reserveCapacity(childArray.count)
+                for el in childArray {
+                    let titleL = (cachedAttr(el, kAXTitleAttribute as String) as? String)?.lowercased() ?? ""
+                    let roleL = (cachedAttr(el, "AXRole") as? String)?.lowercased() ?? ""
+                    let roleDescL = (cachedAttr(el, kAXRoleDescriptionAttribute as String) as? String)?.lowercased() ?? ""
+                    if titleL.contains("reading pane") || titleL.contains("message header") ||
+                       titleL.contains("new mail") || titleL.contains("draft") || titleL.contains("compose") || titleL.contains("editor") || titleL.contains("body") ||
+                       roleDescL.contains("editor") || roleDescL.contains("body") || roleDescL.contains("reading pane") ||
+                       roleL.contains("webarea") || roleL.contains("textarea") || roleL.contains("scrollarea") || roleL.contains("scroll view")
+                    {
+                        priority.append(el)
+                    } else {
+                        others.append(el)
                     }
+                }
+                childArray = priority + others
+            }
+
+            let remaining = timeRemainingMs()
+            let urgent = snapshotMode && remaining < 200
+            let childPrefix = snapshotMode ? (isPriorityBranch ? (urgent ? 32 : 72) : (urgent ? 12 : 24)) : 15
+            let nodeLimitBase = snapshotMode ? (isPriorityBranch ? (urgent ? 120 : 240) : (urgent ? 40 : 80)) : 50
+            if !shouldRecurse {
+                elementAttributes.children = []
+            } else if snapshotMode && depth > 4 && urgent {
+                elementAttributes.children = []
+            } else {
+                for childElement in childArray.prefix(childPrefix) {
+                    if let childAttributes = traverse(childElement, depth: depth + 1, parentPath: path, windowRect: windowRect) {
+                        childrenElements.append(childAttributes)
+                    }
+                    traversedChildren += 1
+                    if traversedChildren >= nodeLimitBase { break }
+                    if let deadline = snapshotDeadline, DispatchTime.now() >= deadline { break }
                 }
             }
             elementAttributes.children = childrenElements
@@ -609,9 +788,109 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
             }
         }
 
+        // Helper: find priority subtree roots within a shallow depth for snapshot mode
+        func findPriorityRoots(_ root: AXUIElement, windowRect: CGRect) -> [AXUIElement] {
+            var queue: [(AXUIElement, Int)] = [(root, 0)]
+            var results: [AXUIElement] = []
+            var seen = Set<AXUIElementWrapper>()
+            let maxDepth = 3
+            while let (el, d) = queue.first {
+                queue.removeFirst()
+                let wrap = AXUIElementWrapper(element: el)
+                if seen.contains(wrap) { continue }
+                seen.insert(wrap)
+
+                let roleL = (cachedAttr(el, "AXRole") as? String)?.lowercased() ?? ""
+                let titleL = (cachedAttr(el, kAXTitleAttribute as String) as? String)?.lowercased() ?? ""
+                let roleDescL = (cachedAttr(el, kAXRoleDescriptionAttribute as String) as? String)?.lowercased() ?? ""
+
+                // Treat scroll-like containers and editor/body areas as priority
+                let hasContents = (cachedAttr(el, "AXContents") as? [AXUIElement]) != nil
+                let hasScrollBars = (cachedAttr(el, "AXHorizontalScrollBar") as! AXUIElement?) != nil || (cachedAttr(el, "AXVerticalScrollBar") as! AXUIElement?) != nil
+                let isScrollLike = roleL.contains("scrollarea") || roleL.contains("scroll view") || roleL.contains("webarea") || hasContents || hasScrollBars
+
+                // Prefer web/textarea/editor/reading containers
+                if isScrollLike || roleL.contains("textarea") ||
+                   titleL.contains("reading pane") || titleL.contains("message header") || titleL.contains("editor") || titleL.contains("compose") || titleL.contains("body") ||
+                   roleDescL.contains("editor") || roleDescL.contains("body")
+                {
+                    results.append(el)
+                    if results.count >= 2 { break }
+                } else {
+                    // Also pick very large panes likely to be content
+                    var pos: CGPoint = .zero
+                    var sz: CGSize = .zero
+                    if let p = cachedAttr(el, kAXPositionAttribute as String) as! AXValue?, AXValueGetType(p) == .cgPoint {
+                        AXValueGetValue(p, .cgPoint, &pos)
+                    }
+                    if let s = cachedAttr(el, kAXSizeAttribute as String) as! AXValue?, AXValueGetType(s) == .cgSize {
+                        AXValueGetValue(s, .cgSize, &sz)
+                    }
+                    let elRect = CGRect(x: pos.x, y: pos.y, width: sz.width, height: sz.height)
+                    let intersectArea = windowRect.intersection(elRect).width * windowRect.intersection(elRect).height
+                    let windowArea = windowRect.width * windowRect.height
+                    if windowArea > 0, intersectArea / windowArea > 0.25 {
+                        results.append(el)
+                        if results.count >= 2 { break }
+                    }
+                }
+
+                if d < maxDepth {
+                    if let vis = cachedAttr(el, "AXVisibleChildren") as? [AXUIElement] {
+                        queue.append(contentsOf: vis.map { ($0, d + 1) })
+                    } else if let all = cachedAttr(el, kAXChildrenAttribute as String) as? [AXUIElement] {
+                        queue.append(contentsOf: all.map { ($0, d + 1) })
+                    }
+                }
+            }
+            return results
+        }
+
         // Run traversal in dedicated queue
         traversalQueue.async {
-            _ = traverse(element, depth: 0)
+            // Compute window rect once
+            var rootPos: CGPoint = .zero
+            var rootSize: CGSize = .zero
+            if let p = cachedAttr(element, kAXPositionAttribute as String) as! AXValue?, AXValueGetType(p) == .cgPoint {
+                AXValueGetValue(p, .cgPoint, &rootPos)
+            }
+            if let s = cachedAttr(element, kAXSizeAttribute as String) as! AXValue?, AXValueGetType(s) == .cgSize {
+                AXValueGetValue(s, .cgSize, &rootSize)
+            }
+            let windowRect = CGRect(x: rootPos.x, y: rootPos.y, width: rootSize.width, height: rootSize.height)
+
+            if snapshotMode {
+                var roots = findPriorityRoots(element, windowRect: windowRect)
+                // Prefer the focused subtree if available
+                if let focusedAny = cachedAttr(element, kAXFocusedUIElementAttribute as String),
+                   CFGetTypeID(focusedAny) == AXUIElementGetTypeID() {
+                    let focused = unsafeBitCast(focusedAny, to: AXUIElement.self)
+                    // climb to a near-root within the window (limit steps)
+                    var anchor: AXUIElement? = focused
+                    var steps = 0
+                    while steps < 6 {
+                        steps += 1
+                        if let parent = cachedAttr(anchor!, "AXParent") as! AXUIElement? {
+                            // Stop if we'd go past the window element
+                            if CFEqual(parent, element) { break }
+                            anchor = parent
+                        } else { break }
+                    }
+                    if let a = anchor {
+                        roots.insert(a, at: 0)
+                    }
+                }
+                if roots.isEmpty {
+                    _ = traverse(element, depth: 0, parentPath: "", windowRect: windowRect)
+                } else {
+                    for r in roots {
+                        if let deadline = snapshotDeadline, DispatchTime.now() >= deadline { break }
+                        _ = traverse(r, depth: 0, parentPath: "", windowRect: windowRect)
+                    }
+                }
+            } else {
+                _ = traverse(element, depth: 0, parentPath: "", windowRect: windowRect)
+            }
 
             // Reset state after traversal
             isTraversing = false
@@ -638,6 +917,11 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
             print("\(String(format: "%.2f", timeInterval))ms - ui traversal")
 
             measureGlobalElementValuesSize()
+
+            // notify snapshot waiter if set
+            if let done = snapshotCompletion {
+                done()
+            }
         }
     }
 }
@@ -646,9 +930,10 @@ func getRelevantValue(_ element: AXUIElement) -> String? {
     let attributesToCheck = ["AXDescription", "AXValue", "AXLabel", "AXRoleDescription", "AXHelp"]
     let unwantedValues = ["0", "", "\u{200E}", "3", "\u{200F}"]  // LRM and RLM marks
     let unwantedLabels = [
-        "window", "application", "group", "button", "image", "text",
-        "pop up button", "region", "notifications", "table", "column",
-        "html content",
+        "window", "application", "group", "image",
+        "pop up button", "region", "notifications", "table", "column"
+        // Intentionally allow web/scroll container descriptions
+        // Note: removed "button" and "text" to capture email addresses and text content
     ]
 
     for attr in attributesToCheck {
@@ -968,8 +1253,8 @@ func setupAccessibilityNotifications(
 
 // Recursive function to register notifications on elements
 func registerNotificationsRecursively(element: AXUIElement, observer: AXObserver, depth: Int = 0) {
-    // Limit recursion depth to prevent infinite loops
-    if depth > 5 { return }
+    // Limit recursion depth to prevent infinite loops - reduced for surface-level content only
+    if depth > 3 { return }
 
     for (_, notification) in notificationsToObserve {
         let result = AXObserverAddNotification(observer, element, notification as CFString, nil)
@@ -1041,6 +1326,42 @@ func describeAXValue(_ axValue: AXValue) -> String {
     }
 }
 
+// Heuristic detection for email-like strings
+func isLikelyEmail(_ s: String) -> Bool {
+    if s.isEmpty || s.count > 254 { return false }
+    if s.contains(" ") { return false }
+    // quick structure check: local@domain
+    let parts = s.split(separator: "@")
+    if parts.count != 2 { return false }
+    let local = parts[0]
+    let domain = parts[1]
+    if local.isEmpty || domain.isEmpty { return false }
+    if !domain.contains(".") { return false }
+    return true
+}
+
+// Extend generic value description to support attributed strings from text areas
+func describeValue(_ value: AnyObject) -> String {
+    switch value {
+    case let str as String:
+        return str
+    case let attr as NSAttributedString:
+        return attr.string
+    case let axValue as AXValue:
+        return describeAXValue(axValue)
+    case is AXUIElement:
+        return "AXUIElement"
+    default:
+        // Try to bridge CFAttributedString to NSAttributedString if possible
+        if CFGetTypeID(value) == CFAttributedStringGetTypeID() {
+            let ref = unsafeBitCast(value, to: CFAttributedString.self)
+            let ns = ref as NSAttributedString
+            return ns.string
+        }
+        return ""
+    }
+}
+
 func getElementPath(_ element: AXUIElement) -> (path: String, depth: Int) {
     var path = [String]()
     var current: AXUIElement? = element
@@ -1069,14 +1390,16 @@ func getElementPath(_ element: AXUIElement) -> (path: String, depth: Int) {
 func buildTextOutput(from windowState: WindowState) -> String {
     var textOutput = ""
     var processedElements = Set<String>()
-    var seenTexts = Set<String>()  // Track unique text values
+    var seenTexts = Set<String>()  // Track unique text values (global)
 
     // Helper function to process text values
     func processText(_ text: String) -> String {
-        if seenTexts.contains(text) {
-            return ""  // Return empty string for duplicate text
+        // Allow duplicates for email-like strings to ensure addresses in
+        // compose fields (To/Cc/Bcc) are not suppressed by previews elsewhere.
+        if !isLikelyEmail(text) {
+            if seenTexts.contains(text) { return "" }
+            seenTexts.insert(text)
         }
-        seenTexts.insert(text)
         return "[\(text)]"
     }
 
@@ -1087,11 +1410,8 @@ func buildTextOutput(from windowState: WindowState) -> String {
 
         // Process each attribute value and join with spaces
         let text = elementAttributes.attributes.values
-            .filter { !seenTexts.contains($0) }
-            .map {
-                seenTexts.insert($0)
-                return "[\($0)]"
-            }
+            .map { processText($0) }
+            .filter { !$0.isEmpty }
             .joined(separator: " ")
 
         if !text.isEmpty {
@@ -1109,9 +1429,7 @@ func buildTextOutput(from windowState: WindowState) -> String {
             return e1.y < e2.y
         }
 
-        for child in sortedChildren {
-            processElement(child, indentLevel: indentLevel + 1)
-        }
+        for child in sortedChildren { processElement(child, indentLevel: indentLevel + 1) }
     }
 
     // Process root elements first (hierarchical)
@@ -1147,11 +1465,8 @@ func buildTextOutput(from windowState: WindowState) -> String {
             // One space per depth level
             let indentStr = String(repeating: " ", count: element.depth)
             let text = element.attributes.values
-                .filter { !seenTexts.contains($0) }
-                .map {
-                    seenTexts.insert($0)
-                    return "[\($0)]"
-                }
+                .map { processText($0) }
+                .filter { !$0.isEmpty }
                 .joined(separator: " ")
 
             if !text.isEmpty {
@@ -1171,7 +1486,7 @@ func saveToDatabase(windowId: WindowIdentifier, newTextOutput: String, timestamp
 
     let startTime = DispatchTime.now()
     let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-    let MAX_CHARS = 300_000
+    let MAX_CHARS = 50_000
 
     // Sanitize window name by removing invisible characters
     let sanitizedWindow = windowId.window
@@ -1594,6 +1909,9 @@ class ScreenPipeDB {
 }
 
 func writeToPipe(uiFrame: UIFrame) throws {
+    if snapshotMode {
+        return
+    }
     let message = uiFrame.toBytes()
     // let bytesWritten = message.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
     //     write(handle, buffer.baseAddress, message.count)
@@ -1619,6 +1937,102 @@ func writeToPipe(uiFrame: UIFrame) throws {
     }
 }
 
+// Support a one-shot snapshot mode for Rust FFI: `ui_monitor --snapshot`
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "--snapshot" {
+    snapshotMode = true
+    // Check AX permissions
+    if !checkAccessibilityPermissions() {
+        print("{\"error\":\"accessibility permissions not granted\"}")
+        exit(2)
+    }
+
+    guard let app = NSWorkspace.shared.frontmostApplication else {
+        print("{\"error\":\"no frontmost application\"}")
+        exit(3)
+    }
+
+    let appName = (app.localizedName?.lowercased() ?? "unknown app")
+        .components(separatedBy: CharacterSet.controlCharacters).joined()
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    let pid = app.processIdentifier
+    let axApp = AXUIElementCreateApplication(pid)
+
+    var winRef: AnyObject?
+    let r = AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &winRef)
+    guard r == .success, let windowElement = winRef as! AXUIElement? else {
+        let payload = [
+            "window": "unknown window",
+            "app": appName,
+            "text_output": "",
+            "initial_traversal_at": ISO8601DateFormatter().string(from: Date()),
+        ]
+        if let json = try? JSONSerialization.data(withJSONObject: payload, options: []) {
+            print(String(data: json, encoding: .utf8)!)
+        }
+        exit(0)
+    }
+
+    var windowName = "unknown window"
+    if let titleValue = getAttributeValue(windowElement, forAttribute: kAXTitleAttribute) as? String {
+        windowName = titleValue.lowercased()
+            .components(separatedBy: CharacterSet.controlCharacters).joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Ensure state buckets exist
+    if globalElementValues[appName] == nil { globalElementValues[appName] = [:] }
+    if globalElementValues[appName]?[windowName] == nil { globalElementValues[appName]?[windowName] = WindowState() }
+
+    // Parse optional timeout override: --timeout-ms NNN or --timeout-ms=NNN
+    var timeoutMs: Int = 1500
+    if CommandLine.arguments.count > 2 {
+        for i in 2..<CommandLine.arguments.count {
+            let arg = CommandLine.arguments[i]
+            if arg.hasPrefix("--timeout-ms=") {
+                if let v = Int(arg.split(separator: "=").last ?? "1200") { timeoutMs = v }
+            } else if arg == "--timeout-ms" {
+                if i + 1 < CommandLine.arguments.count, let v = Int(CommandLine.arguments[i+1]) { timeoutMs = v }
+            }
+        }
+    }
+
+    // Kick traversal and wait for completion (with timeout)
+    let group = DispatchGroup()
+    group.enter()
+    snapshotCompletion = { group.leave() }
+    // Set a hard deadline for traversal checks
+    let cancelDeadline = DispatchTime.now() + .milliseconds(timeoutMs)
+    snapshotDeadline = cancelDeadline
+    traverseAndStoreUIElements(windowElement, appName: appName, windowName: windowName)
+
+    // Also schedule a cancellation to ensure traversal halts around timeout
+    DispatchQueue.global().asyncAfter(deadline: cancelDeadline) {
+        if isTraversing { shouldCancelTraversal = true }
+    }
+
+    // Wait bounded by timeout; if not done, leave group
+    if group.wait(timeout: .now() + .milliseconds(timeoutMs)) == .timedOut {
+        // Force completion to avoid hang
+        snapshotCompletion = nil
+    }
+
+    let windowState = globalElementValues[appName]?[windowName] ?? WindowState()
+    let text = buildTextOutput(from: windowState)
+    let payload = [
+        "window": windowName,
+        "app": appName,
+        "text_output": text,
+        "initial_traversal_at": ISO8601DateFormatter().string(from: Date()),
+    ]
+    if let json = try? JSONSerialization.data(withJSONObject: payload, options: []) {
+        print(String(data: json, encoding: .utf8)!)
+    }
+    snapshotDeadline = nil
+    exit(0)
+}
+
+// Legacy daemon mode: expects a named pipe path
 guard CommandLine.arguments.count > 1 else {
     print("error: named pipe path not provided")
     exit(1)

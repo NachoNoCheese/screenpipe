@@ -110,26 +110,27 @@ pub(crate) struct SearchQuery {
     start_time: Option<DateTime<Utc>>,
     #[serde(default)]
     end_time: Option<DateTime<Utc>>,
-    #[serde(default)]
+    #[serde(default, alias = "appName")]
     app_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "windowName")]
     window_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "frameName")]
     frame_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "includeFrames")]
     include_frames: bool,
-    #[serde(default)]
+    #[serde(default, alias = "minLength")]
     min_length: Option<usize>,
-    #[serde(default)]
+    #[serde(default, alias = "maxLength")]
     max_length: Option<usize>,
     #[serde(
         deserialize_with = "from_comma_separated_array",
-        default = "default_speaker_ids"
+        default = "default_speaker_ids",
+        alias = "speakerIds"
     )]
     speaker_ids: Option<Vec<i64>>,
     #[serde(default)]
     focused: Option<bool>,
-    #[serde(default)]
+    #[serde(default, alias = "browserUrl")]
     browser_url: Option<String>,
 }
 
@@ -237,6 +238,7 @@ pub struct UiContent {
     pub initial_traversal_at: Option<DateTime<Utc>>,
     pub file_path: String,
     pub offset_index: i64,
+    pub frame: Option<String>,
     pub frame_name: Option<String>,
     pub browser_url: Option<String>,
 }
@@ -411,6 +413,7 @@ pub(crate) async fn search(
                 initial_traversal_at: ui.initial_traversal_at,
                 file_path: ui.file_path.clone(),
                 offset_index: ui.offset_index,
+                frame: None,
                 frame_name: ui.frame_name.clone(),
                 browser_url: ui.browser_url.clone(),
             }),
@@ -418,26 +421,85 @@ pub(crate) async fn search(
         .collect();
 
     if query.include_frames {
-        debug!("extracting frames for ocr content");
-        let frame_futures: Vec<_> = content_items
-            .iter()
-            .filter_map(|item| {
-                if let ContentItem::OCR(ocr_content) = item {
-                    Some(extract_frame(
-                        &ocr_content.file_path,
-                        ocr_content.offset_index,
-                    ))
-                } else {
-                    None
+        debug!("extracting frames for ocr/ui content");
+        // Build extraction futures for both OCR and UI items with a unified future type
+        let mut frame_futures: Vec<(
+            usize,
+            bool,
+            std::pin::Pin<
+                Box<
+                    dyn futures::Future<Output = std::result::Result<String, anyhow::Error>> + Send,
+                >,
+            >,
+        )> = Vec::new();
+
+        for (idx_item, item) in content_items.iter().enumerate() {
+            match item {
+                ContentItem::OCR(ocr) => {
+                    let file = ocr.file_path.clone();
+                    let ts = ocr.timestamp;
+                    let idx = ocr.offset_index;
+                    let fut = async move {
+                        if let Ok(img) =
+                            crate::video_utils::extract_frame_by_index_base64(&file, idx).await
+                        {
+                            return Ok(img);
+                        }
+                        if let Ok(img) = extract_frame(&file, idx).await {
+                            return Ok(img);
+                        }
+                        if let Ok(img) = extract_frame(&file, idx - 1).await {
+                            return Ok(img);
+                        }
+                        if let Ok(img) = extract_frame(&file, idx + 1).await {
+                            return Ok(img);
+                        }
+                        crate::video_utils::extract_frame_by_timestamp_base64(&file, ts).await
+                    };
+                    frame_futures.push((idx_item, true, Box::pin(fut)));
                 }
-            })
-            .collect();
+                ContentItem::UI(ui) => {
+                    let file = ui.file_path.clone();
+                    let idx = ui.offset_index;
+                    let fut = async move {
+                        if let Ok(img) =
+                            crate::video_utils::extract_frame_by_index_base64(&file, idx).await
+                        {
+                            return Ok(img);
+                        }
+                        if let Ok(img) = extract_frame(&file, idx).await {
+                            return Ok(img);
+                        }
+                        if let Ok(img) = extract_frame(&file, idx - 1).await {
+                            return Ok(img);
+                        }
+                        extract_frame(&file, idx + 1).await
+                    };
+                    frame_futures.push((idx_item, false, Box::pin(fut)));
+                }
+                _ => {}
+            }
+        }
 
-        let frames = try_join_all(frame_futures).await.unwrap(); // TODO: handle error
+        use futures::future::join_all;
+        let results = join_all(
+            frame_futures
+                .into_iter()
+                .map(|(i, is_ocr, fut)| async move { (i, is_ocr, fut.await) }),
+        )
+        .await;
 
-        for (item, frame) in content_items.iter_mut().zip(frames.into_iter()) {
-            if let ContentItem::OCR(ref mut ocr_content) = item {
-                ocr_content.frame = Some(frame);
+        for (i, is_ocr, res) in results {
+            if let Ok(img) = res {
+                match content_items.get_mut(i) {
+                    Some(ContentItem::OCR(o)) if is_ocr => {
+                        o.frame = Some(img);
+                    }
+                    Some(ContentItem::UI(u)) if !is_ocr => {
+                        u.frame = Some(img);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1091,7 +1153,9 @@ async fn get_pipe_info_handler(
 }
 
 #[oasgen]
-async fn list_pipes_handler(State(state): State<Arc<AppState>>) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+async fn list_pipes_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
     if !state.enable_pipe_manager {
         return Err((
             StatusCode::FORBIDDEN,
@@ -1440,7 +1504,13 @@ async fn write_frames_to_video(
     video_file_path: &str,
     fps: f64,
 ) -> Result<(), anyhow::Error> {
-    let mut ffmpeg_child = start_ffmpeg_process(video_file_path, fps).await?;
+    // best-effort: align video creation_time to the first frame timestamp if available
+    let creation_time_override = frames
+        .first()
+        .and_then(|f| f.timestamp)
+        .or_else(|| Some(Utc::now()));
+    let mut ffmpeg_child =
+        start_ffmpeg_process(video_file_path, fps, creation_time_override).await?;
     let mut ffmpeg_stdin = ffmpeg_child
         .stdin
         .take()

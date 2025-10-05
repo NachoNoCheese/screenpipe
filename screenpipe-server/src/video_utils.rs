@@ -39,7 +39,15 @@ struct Stream {
 pub async fn extract_frame(file_path: &str, offset_index: i64) -> Result<String> {
     let ffmpeg_path = find_ffmpeg_path().expect("failed to find ffmpeg path");
 
-    let offset_seconds = offset_index as f64 / 1000.0;
+    let source_fps = match get_video_fps(&ffmpeg_path, file_path).await {
+        Ok(fps) => fps,
+        Err(e) => {
+            error!("failed to get video fps, using default 1fps: {}", e);
+            1.0
+        }
+    };
+
+    let offset_seconds = offset_index as f64 / source_fps;
     let offset_str = format!("{:.3}", offset_seconds);
 
     debug!(
@@ -50,10 +58,10 @@ pub async fn extract_frame(file_path: &str, offset_index: i64) -> Result<String>
     let mut command = Command::new(ffmpeg_path);
     command
         .args([
-            "-ss",
-            &offset_str,
             "-i",
             file_path,
+            "-ss",
+            &offset_str,
             "-vf",
             "scale=iw*0.75:ih*0.75", // Scale down to 75% of original size
             "-vframes",
@@ -91,6 +99,169 @@ pub async fn extract_frame(file_path: &str, offset_index: i64) -> Result<String>
     }
 
     Ok(general_purpose::STANDARD.encode(frame_data))
+}
+
+/// Extract a frame by exact frame index using ffmpeg select filter and return base64 JPEG
+pub async fn extract_frame_by_index_base64(file_path: &str, index: i64) -> Result<String> {
+    let ffmpeg_path = find_ffmpeg_path().expect("failed to find ffmpeg path");
+
+    // Use select filter for exact frame index; ensure mjpeg pipe out
+    let select_filter = format!("select='eq(n,{})'", index.max(0));
+
+    let mut command = Command::new(&ffmpeg_path);
+    command
+        .args([
+            "-i",
+            file_path,
+            "-vf",
+            &select_filter,
+            "-vframes",
+            "1",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "10",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    debug!("ffmpeg (select index) command: {:?}", command);
+
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().expect("failed to open stdout");
+    let mut stderr = child.stderr.take().expect("failed to open stderr");
+
+    let mut frame_data = Vec::new();
+    stdout.read_to_end(&mut frame_data).await?;
+    let status = child.wait().await?;
+
+    if status.success() && !frame_data.is_empty() {
+        return Ok(general_purpose::STANDARD.encode(frame_data));
+    }
+
+    let mut error_message = String::new();
+    stderr.read_to_string(&mut error_message).await.ok();
+    Err(anyhow::anyhow!(
+        "ffmpeg select(n,{}) failed: {}",
+        index,
+        error_message
+    ))
+}
+
+/// Extract a frame as base64 at or after a given absolute timestamp by
+/// computing time offset from the video's creation_time/filename and seeking.
+pub async fn extract_frame_by_timestamp_base64(
+    file_path: &str,
+    target_timestamp: DateTime<Utc>,
+) -> Result<String> {
+    let ffmpeg_path = find_ffmpeg_path().expect("failed to find ffmpeg path");
+
+    // Determine chunk start (creation) time
+    let metadata = get_video_metadata(file_path).await?;
+    let start_time = metadata.creation_time;
+
+    // Compute seek seconds (first frame at or after this time)
+    let delta = target_timestamp.signed_duration_since(start_time);
+    let mut t_seek = delta.num_milliseconds() as f64 / 1000.0;
+    if !t_seek.is_finite() || t_seek < 0.0 {
+        t_seek = 0.0;
+    }
+    let t_seek_str = format!("{:.3}", t_seek);
+
+    debug!(
+        "extracting frame by timestamp from {} at t_seek {} (start: {}, target: {})",
+        file_path, t_seek_str, start_time, target_timestamp
+    );
+
+    // Attempt 1: time-based accurate seek
+    let mut command = Command::new(&ffmpeg_path);
+    command
+        .args([
+            "-i",
+            file_path,
+            "-ss",
+            &t_seek_str,
+            "-vframes",
+            "1",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "10",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    debug!("ffmpeg (time-seek) command: {:?}", command);
+
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().expect("failed to open stdout");
+    let mut stderr = child.stderr.take().expect("failed to open stderr");
+
+    let mut frame_data = Vec::new();
+    stdout.read_to_end(&mut frame_data).await?;
+    let status = child.wait().await?;
+
+    if status.success() && !frame_data.is_empty() {
+        return Ok(general_purpose::STANDARD.encode(frame_data));
+    }
+
+    // If time-based seek failed or produced no data, fall back to exact frame selection
+    // Compute index = ceil(t_seek * fps) and select that frame by index
+    let fps = get_video_fps(&ffmpeg_path, file_path).await.unwrap_or(1.0);
+    let idx_after = (t_seek * fps).ceil().max(0.0) as i64;
+    let select_filter = format!("select='eq(n,{})'", idx_after);
+
+    let mut fallback_cmd = Command::new(&ffmpeg_path);
+    fallback_cmd
+        .args([
+            "-i",
+            file_path,
+            "-vf",
+            &select_filter,
+            "-vframes",
+            "1",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "10",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    debug!(
+        "ffmpeg (fallback select idx={}) command: {:?}",
+        idx_after, fallback_cmd
+    );
+
+    let mut child2 = fallback_cmd.spawn()?;
+    let mut stdout2 = child2.stdout.take().expect("failed to open stdout");
+    let mut _stderr2 = child2.stderr.take().expect("failed to open stderr");
+    let mut frame2 = Vec::new();
+    stdout2.read_to_end(&mut frame2).await?;
+    let status2 = child2.wait().await?;
+    if status2.success() && !frame2.is_empty() {
+        return Ok(general_purpose::STANDARD.encode(frame2));
+    }
+
+    // If still nothing, return error with original stderr for debugging
+    let mut error_message = String::new();
+    stderr.read_to_string(&mut error_message).await.ok();
+    Err(anyhow::anyhow!(
+        "ffmpeg extraction failed (t_seek={}, fps={}, idx={}): {}",
+        t_seek_str,
+        fps,
+        idx_after,
+        error_message
+    ))
 }
 
 #[derive(OaSchema, Deserialize)]
@@ -565,7 +736,7 @@ pub async fn extract_frame_from_video(file_path: &str, offset_index: i64) -> Res
         }
     };
 
-    let offset_seconds = offset_index as f64 * source_fps;
+    let offset_seconds = offset_index as f64 / source_fps;
     let offset_str = format!("{:.3}", offset_seconds);
 
     // Create a temporary directory for frames if it doesn't exist
@@ -587,10 +758,10 @@ pub async fn extract_frame_from_video(file_path: &str, offset_index: i64) -> Res
     let mut command = Command::new(ffmpeg_path);
     command
         .args([
-            "-ss",
-            &offset_str,
             "-i",
             file_path,
+            "-ss",
+            &offset_str,
             "-vf",
             "scale=iw:ih,format=yuvj420p", // Add format conversion
             "-vframes",
@@ -669,7 +840,7 @@ pub async fn extract_high_quality_frame(
         }
     };
 
-    let frame_time = offset_index as f64 * source_fps;
+    let frame_time = offset_index as f64 / source_fps;
 
     let frame_filename = format!(
         "frame_{}_{}.png",
@@ -683,10 +854,10 @@ pub async fn extract_high_quality_frame(
         "-y",
         "-loglevel",
         "error",
-        "-ss",
-        &frame_time.to_string(),
         "-i",
         file_path,
+        "-ss",
+        &frame_time.to_string(),
         "-vframes",
         "1",
         "-vf",

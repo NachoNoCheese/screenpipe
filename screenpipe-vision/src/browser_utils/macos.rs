@@ -77,6 +77,7 @@ impl MacOSUrlDetector {
     }
 
     fn get_url_via_applescript(&self, script: &str) -> Result<Option<String>> {
+        tracing::info!("Attempting AppleScript: {}", script);
         let output = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
@@ -84,7 +85,11 @@ impl MacOSUrlDetector {
 
         if output.status.success() {
             let url = String::from_utf8(output.stdout)?.trim().to_string();
+            tracing::info!("AppleScript success, got URL: {}", url);
             return Ok(Some(url));
+        } else {
+            let error = String::from_utf8(output.stderr).unwrap_or_default();
+            tracing::warn!("AppleScript failed: {}", error);
         }
         Ok(None)
     }
@@ -139,11 +144,35 @@ impl MacOSUrlDetector {
 }
 
 impl BrowserUrlDetector for MacOSUrlDetector {
-    fn get_active_url(&self, app_name: &str, process_id: i32, _window_title: &str) -> Result<Option<String>> {
-        if app_name == "Arc" {
+    fn get_active_url(
+        &self,
+        app_name: &str,
+        process_id: i32,
+        _window_title: &str,
+    ) -> Result<Option<String>> {
+        tracing::info!("Browser URL detection called for app: {}", app_name);
+        let app_name_lower = app_name.to_lowercase();
+        if app_name_lower == "arc" {
             let script = r#"tell application "Arc" to return URL of active tab of front window"#;
             self.get_url_via_applescript(script)
+        } else if app_name_lower == "brave browser" {
+            let script =
+                r#"tell application "Brave Browser" to return URL of active tab of front window"#;
+            self.get_url_via_applescript(script)
+        } else if app_name_lower == "safari" {
+            let script =
+                r#"tell application "Safari" to return URL of current tab of front window"#;
+            self.get_url_via_applescript(script)
+        } else if app_name_lower == "google chrome" {
+            let script =
+                r#"tell application "Google Chrome" to return URL of active tab of front window"#;
+            self.get_url_via_applescript(script)
+        } else if app_name_lower == "microsoft edge" {
+            let script =
+                r#"tell application "Microsoft Edge" to return URL of active tab of front window"#;
+            self.get_url_via_applescript(script)
         } else {
+            tracing::info!("Using accessibility API for app: {}", app_name);
             self.get_url_via_accessibility(process_id)
         }
     }

@@ -386,6 +386,136 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Upsert a UI monitoring row to mirror accessibility text for the current frame context.
+    /// If the ui_monitoring table does not exist (e.g., non-mac or feature disabled), this no-ops.
+    pub async fn upsert_ui_monitoring(
+        &self,
+        timestamp: DateTime<Utc>,
+        initial_traversal_at: Option<DateTime<Utc>>,
+        app_name: &str,
+        window_name: &str,
+        text_output: &str,
+        frame_id: i64,
+    ) -> Result<(), anyhow::Error> {
+        // Gracefully skip if table is absent
+        let table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+
+        if !table_exists {
+            return Ok(());
+        }
+
+        // Ensure frame_id column exists (one-time migration)
+        let has_frame_id = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM pragma_table_info('ui_monitoring') WHERE name='frame_id'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+
+        if !has_frame_id {
+            let _ = sqlx::query("ALTER TABLE ui_monitoring ADD COLUMN frame_id INTEGER")
+                .execute(&self.pool)
+                .await;
+        }
+
+        // Ensure unique index on frame_id so we have at most one UI row per frame
+        let _ = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ui_monitoring_frame_id ON ui_monitoring(frame_id)"
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Upsert by frame_id to guarantee one UI row per captured frame
+        let result = sqlx::query(
+            r#"
+            INSERT INTO ui_monitoring (timestamp, initial_traversal_at, app, window, text_output, frame_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(frame_id) DO UPDATE SET
+                timestamp = excluded.timestamp,
+                text_output = excluded.text_output,
+                initial_traversal_at = COALESCE(ui_monitoring.initial_traversal_at, excluded.initial_traversal_at),
+                app = excluded.app,
+                window = excluded.window
+            "#,
+        )
+        .bind(timestamp)
+        .bind(initial_traversal_at.unwrap_or(timestamp))
+        .bind(app_name)
+        .bind(window_name)
+        .bind(text_output)
+        .bind(frame_id)
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!(e)),
+        }
+    }
+
+    /// Check if a UI monitoring row already exists for a given frame_id
+    pub async fn ui_monitoring_exists_for_frame(
+        &self,
+        frame_id: i64,
+    ) -> Result<bool, anyhow::Error> {
+        // Return false if table doesn't exist
+        let table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+
+        if !table_exists {
+            return Ok(false);
+        }
+
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM ui_monitoring WHERE frame_id = ?1 LIMIT 1")
+                .bind(frame_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(exists.is_some())
+    }
+
+    /// Fetch latest accessibility text for a given (app, window)
+    pub async fn get_latest_ui_text_for_app_window(
+        &self,
+        app_name: &str,
+        window_name: &str,
+    ) -> Result<Option<String>, anyhow::Error> {
+        // Return None if table doesn't exist
+        let table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+
+        if !table_exists {
+            return Ok(None);
+        }
+
+        let res: Option<(String,)> = sqlx::query_as(
+            r#"SELECT text_output FROM ui_monitoring WHERE app = ?1 AND window = ?2 ORDER BY timestamp DESC LIMIT 1"#,
+        )
+        .bind(app_name)
+        .bind(window_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(res.map(|t| t.0))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
@@ -406,9 +536,12 @@ impl DatabaseManager {
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let mut results = Vec::new();
 
-        // if focused or browser_url is present, we run only on OCR
-        if focused.is_some() || browser_url.is_some() {
-            content_type = ContentType::OCR;
+        // if focused or browser_url is present, we run only on OCR,
+        // EXCEPT when the caller explicitly requested UI
+        if content_type != ContentType::UI {
+            if focused.is_some() || browser_url.is_some() {
+                content_type = ContentType::OCR;
+            }
         }
 
         match content_type {
@@ -449,6 +582,8 @@ impl DatabaseManager {
                                 end_time,
                                 limit,
                                 offset,
+                                browser_url,
+                                focused,
                             )
                         )?;
                         (ocr, Some(audio), ui)
@@ -477,6 +612,8 @@ impl DatabaseManager {
                                 end_time,
                                 limit,
                                 offset,
+                                browser_url,
+                                focused,
                             )
                         )?;
                         (ocr, None, ui)
@@ -534,6 +671,8 @@ impl DatabaseManager {
                         end_time,
                         limit,
                         offset,
+                        browser_url,
+                        focused,
                     )
                     .await?;
                 results.extend(ui_results.into_iter().map(SearchResult::UI));
@@ -560,6 +699,8 @@ impl DatabaseManager {
                         end_time,
                         limit / 2,
                         offset,
+                        browser_url,
+                        focused,
                     )
                     .await?;
 
@@ -592,6 +733,8 @@ impl DatabaseManager {
                         end_time,
                         limit / 2,
                         offset,
+                        browser_url,
+                        focused,
                     )
                     .await?;
 
@@ -705,15 +848,15 @@ impl DatabaseManager {
         let sql = format!(
             r#"
         SELECT
-            ocr_text.frame_id,
-            ocr_text.text as ocr_text,
-            ocr_text.text_json,
+            o.frame_id,
+            o.text as ocr_text,
+            o.text_json,
             frames.timestamp,
             frames.name as frame_name,
             video_chunks.file_path,
             frames.offset_index,
             frames.app_name,
-            ocr_text.ocr_engine,
+            o.ocr_engine,
             frames.window_name,
             video_chunks.device_name,
             GROUP_CONCAT(tags.name, ',') as tags,
@@ -721,7 +864,9 @@ impl DatabaseManager {
             frames.focused
         FROM frames
         JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
-        JOIN ocr_text ON frames.id = ocr_text.frame_id
+        JOIN ocr_text AS o ON o.frame_id = frames.id AND o.rowid = (
+            SELECT MIN(rowid) FROM ocr_text WHERE frame_id = frames.id
+        )
         LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
         LEFT JOIN tags ON vision_tags.tag_id = tags.id
         {frame_fts_join}
@@ -731,8 +876,8 @@ impl DatabaseManager {
             {ocr_fts_condition}
             AND (?2 IS NULL OR frames.timestamp >= ?2)
             AND (?3 IS NULL OR frames.timestamp <= ?3)
-            AND (?4 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) >= ?4)
-            AND (?5 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) <= ?5)
+            AND (?4 IS NULL OR COALESCE(o.text_length, LENGTH(o.text)) >= ?4)
+            AND (?5 IS NULL OR COALESCE(o.text_length, LENGTH(o.text)) <= ?5)
         GROUP BY frames.id
         ORDER BY frames.timestamp DESC
         LIMIT ?7 OFFSET ?8
@@ -745,7 +890,7 @@ impl DatabaseManager {
             ocr_fts_join = if query.trim().is_empty() {
                 ""
             } else {
-                "JOIN ocr_text_fts ON ocr_text.frame_id = ocr_text_fts.frame_id"
+                "JOIN ocr_text_fts ON o.frame_id = ocr_text_fts.frame_id"
             },
             frame_fts_condition = if frame_query.trim().is_empty() {
                 ""
@@ -1582,6 +1727,8 @@ impl DatabaseManager {
         end_time: Option<DateTime<Utc>>,
         limit: u32,
         offset: u32,
+        browser_url: Option<&str>,
+        focused: Option<bool>,
     ) -> Result<Vec<UiContent>, sqlx::Error> {
         // combine search aspects into single fts query
         let mut fts_parts = Vec::new();
@@ -1596,16 +1743,27 @@ impl DatabaseManager {
         }
         let combined_query = fts_parts.join(" ");
 
-        let base_sql = if combined_query.is_empty() {
-            "ui_monitoring"
-        } else {
+        // Add debug logging
+        tracing::info!("UI search FTS query: '{}'", combined_query);
+        tracing::info!(
+            "UI search app_name: {:?}, window_name: {:?}",
+            app_name,
+            window_name
+        );
+
+        // Always use FTS table when we have any filters (app, window, or text)
+        let use_fts = !combined_query.is_empty() || app_name.is_some() || window_name.is_some();
+
+        let base_sql = if use_fts {
             "ui_monitoring_fts JOIN ui_monitoring ON ui_monitoring_fts.ui_id = ui_monitoring.id"
+        } else {
+            "ui_monitoring"
         };
 
-        let where_clause = if combined_query.is_empty() {
-            "WHERE 1=1"
-        } else {
+        let where_clause = if use_fts {
             "WHERE ui_monitoring_fts MATCH ?1"
+        } else {
+            "WHERE 1=1"
         };
 
         let sql = format!(
@@ -1622,14 +1780,14 @@ impl DatabaseManager {
                 frames.name as frame_name,
                 frames.browser_url
             FROM {}
-            LEFT JOIN frames ON
-                frames.timestamp BETWEEN
-                    datetime(ui_monitoring.timestamp, '-1 seconds')
-                    AND datetime(ui_monitoring.timestamp, '+1 seconds')
+            LEFT JOIN frames ON frames.id = ui_monitoring.frame_id
             LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
             {}
+                AND ui_monitoring.frame_id IS NOT NULL
                 AND (?2 IS NULL OR ui_monitoring.timestamp >= ?2)
                 AND (?3 IS NULL OR ui_monitoring.timestamp <= ?3)
+                AND (?6 IS NULL OR frames.browser_url LIKE ?6)
+                AND (?7 IS NULL OR frames.focused = ?7)
             GROUP BY ui_monitoring.id
             ORDER BY ui_monitoring.timestamp DESC
             LIMIT ?4 OFFSET ?5
@@ -1638,15 +1796,21 @@ impl DatabaseManager {
         );
 
         sqlx::query_as(&sql)
-            .bind(if combined_query.is_empty() {
-                "*".to_owned()
+            .bind(if use_fts {
+                if combined_query.is_empty() {
+                    "*".to_owned()
+                } else {
+                    combined_query
+                }
             } else {
-                combined_query
+                "*".to_owned()
             })
             .bind(start_time)
             .bind(end_time)
             .bind(limit)
             .bind(offset)
+            .bind(browser_url.map(|url| format!("%{}%", url)))
+            .bind(focused)
             .fetch_all(&self.pool)
             .await
     }

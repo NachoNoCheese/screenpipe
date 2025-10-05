@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
@@ -137,45 +137,10 @@ impl VideoCapture {
             let start_time = std::time::Instant::now();
             let mut last_log_time = start_time;
             let log_interval = Duration::from_secs(30); // Log stats every 30 seconds
-
-            // Helper function to push to queue and handle errors
-            fn push_to_queue(
-                queue: &ArrayQueue<Arc<CaptureResult>>,
-                result: &Arc<CaptureResult>,
-                queue_name: &str,
-            ) -> bool {
-                if queue.push(Arc::clone(result)).is_err() {
-                    if queue.len() >= queue.capacity() {
-                        error!(
-                            "{} queue is full ({}/{})",
-                            queue_name,
-                            queue.len(),
-                            queue.capacity()
-                        );
-                    }
-
-                    if queue.pop().is_none() {
-                        error!("{} queue is in an inconsistent state", queue_name);
-                        return false;
-                    }
-                    if queue.push(Arc::clone(result)).is_err() {
-                        error!(
-                            "Failed to push to {} queue after removing oldest frame",
-                            queue_name
-                        );
-                        return false;
-                    }
-                    debug!(
-                        "{} queue was full, dropped oldest frame, new size: {}/{}",
-                        queue_name,
-                        queue.len(),
-                        queue.capacity()
-                    );
-                }
-                true
-            }
+            let mut dropped_pairs_total: u64 = 0;
 
             while let Some(result) = result_receiver.recv().await {
+                let iter_start = Instant::now();
                 let frame_number = result.frame_number;
                 processed_count += 1;
 
@@ -189,8 +154,8 @@ impl VideoCapture {
                         0.0
                     };
                     info!(
-                        "Queue stats for monitor {}: processed {} frames in {:.1}s ({:.2} fps), queue sizes: video={}/{}, ocr={}/{}",
-                        monitor_id, processed_count, elapsed_secs, rate,
+                        "Queue stats for monitor {}: processed {} frames in {:.1}s ({:.2} fps), dropped_pairs_total={}, queue sizes: video={}/{}, ocr={}/{}",
+                        monitor_id, processed_count, elapsed_secs, rate, dropped_pairs_total,
                         capture_video_frame_queue.len(), capture_video_frame_queue.capacity(),
                         capture_ocr_frame_queue.len(), capture_ocr_frame_queue.capacity()
                     );
@@ -201,24 +166,52 @@ impl VideoCapture {
 
                 let result = Arc::new(result);
 
-                let video_pushed = push_to_queue(&capture_video_frame_queue, &result, "Video");
-                let ocr_pushed = push_to_queue(&capture_ocr_frame_queue, &result, "OCR");
-
-                if !video_pushed || !ocr_pushed {
-                    error!(
-                        "Failed to push frame {} to one or more queues",
-                        frame_number
+                // Ensure both queues have space; if either is full, drop one from both to keep alignment
+                while capture_video_frame_queue.len() >= capture_video_frame_queue.capacity()
+                    || capture_ocr_frame_queue.len() >= capture_ocr_frame_queue.capacity()
+                {
+                    let dropped_video = capture_video_frame_queue.pop().is_some();
+                    let dropped_ocr = capture_ocr_frame_queue.pop().is_some();
+                    if dropped_video || dropped_ocr { dropped_pairs_total += 1; }
+                    warn!(
+                        "queues full, dropped oldest: video_dropped={}, ocr_dropped={}, sizes: video={}/{}, ocr={}/{}",
+                        dropped_video,
+                        dropped_ocr,
+                        capture_video_frame_queue.len(),
+                        capture_video_frame_queue.capacity(),
+                        capture_ocr_frame_queue.len(),
+                        capture_ocr_frame_queue.capacity()
                     );
-                    continue; // Skip to next iteration instead of crashing
                 }
 
-                debug!(
-                    "Frame {} pushed to queues. Queue lengths: video={}/{}, ocr={}/{}",
+                // Push to both queues now that space is ensured
+                let enqueue_start = Instant::now();
+                if capture_video_frame_queue.push(Arc::clone(&result)).is_err() {
+                    error!("failed to enqueue video frame {}", frame_number);
+                    continue;
+                }
+                if capture_ocr_frame_queue.push(Arc::clone(&result)).is_err() {
+                    error!("failed to enqueue ocr frame {}", frame_number);
+                    // Roll back the video push to keep counts aligned
+                    let _ = capture_video_frame_queue.pop();
+                    continue;
+                }
+                let enqueue_ms = enqueue_start.elapsed().as_millis();
+
+                info!(
+                    "capture enqueue: frame={} video_q={}/{} ocr_q={}/{} ({} ms)",
                     frame_number,
                     capture_video_frame_queue.len(),
                     capture_video_frame_queue.capacity(),
                     capture_ocr_frame_queue.len(),
-                    capture_ocr_frame_queue.capacity()
+                    capture_ocr_frame_queue.capacity(),
+                    enqueue_ms
+                );
+
+                let iter_ms = iter_start.elapsed().as_millis();
+                info!(
+                    "capture iteration: frame={} took {} ms",
+                    frame_number, iter_ms
                 );
             }
 
@@ -337,7 +330,11 @@ impl VideoCapture {
     }
 }
 
-pub async fn start_ffmpeg_process(output_file: &str, fps: f64) -> Result<Child, anyhow::Error> {
+pub async fn start_ffmpeg_process(
+    output_file: &str,
+    fps: f64,
+    creation_time_override: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Child, anyhow::Error> {
     // Overriding fps with max fps if over the max and warning user
     let fps = if fps > MAX_FPS {
         warn!("Overriding FPS from {} to {}", fps, MAX_FPS);
@@ -372,6 +369,11 @@ pub async fn start_ffmpeg_process(output_file: &str, fps: f64) -> Result<Child, 
         "-crf",
         "23",
     ]);
+
+    // Explicitly set creation_time metadata to improve timestamp-based seeking reliability
+    let creation_time = creation_time_override.unwrap_or_else(Utc::now).to_rfc3339();
+    let creation_meta = format!("creation_time={}", creation_time);
+    args.extend_from_slice(&["-metadata", &creation_meta]);
 
     args.extend_from_slice(&["-pix_fmt", "yuv420p", output_file]);
 
@@ -432,11 +434,17 @@ async fn save_frames_as_video(
     loop {
         if frame_count >= frames_per_video || current_ffmpeg.is_none() {
             if let Some(child) = current_ffmpeg.take() {
+                let finish_start = Instant::now();
                 info!(
                     "Finishing FFmpeg process for monitor {} after {} frames",
                     monitor_id, frame_count
                 );
                 finish_ffmpeg_process(child, current_stdin.take()).await;
+                let finish_ms = finish_start.elapsed().as_millis();
+                info!(
+                    "ffmpeg finish completed for monitor {} in {} ms",
+                    monitor_id, finish_ms
+                );
                 chunks_total += 1;
             }
 
@@ -453,7 +461,15 @@ async fn save_frames_as_video(
             );
             new_chunk_callback(&output_file);
 
-            match start_ffmpeg_process(&output_file, fps).await {
+            // Align creation_time to the first captured frame's wall-clock time
+            let creation_time_dt = {
+                let elapsed = first_frame.timestamp.elapsed();
+                let dur = chrono::Duration::from_std(elapsed).unwrap_or(chrono::Duration::zero());
+                Utc::now() - dur
+            };
+
+            let start_ffmpeg_at = Instant::now();
+            match start_ffmpeg_process(&output_file, fps, Some(creation_time_dt)).await {
                 Ok(mut child) => {
                     let mut stdin = child.stdin.take().expect("Failed to open stdin");
                     spawn_ffmpeg_loggers(child.stderr.take(), child.stdout.take());
@@ -471,9 +487,10 @@ async fn save_frames_as_video(
 
                     current_ffmpeg = Some(child);
                     current_stdin = Some(stdin);
+                    let start_ms = start_ffmpeg_at.elapsed().as_millis();
                     info!(
-                        "New FFmpeg process started for file: {} (monitor {})",
-                        output_file, monitor_id
+                        "New FFmpeg process started for file: {} (monitor {}) in {} ms",
+                        output_file, monitor_id, start_ms
                     );
                 }
                 Err(e) => {
@@ -575,14 +592,21 @@ async fn process_frames(
     let write_timeout = Duration::from_secs_f64(1.0 / fps);
     while *frame_count < frames_per_video {
         if let Some(frame) = frame_queue.pop() {
+            let enc_start = Instant::now();
             let buffer = encode_frame(&frame);
             if let Some(stdin) = current_stdin.as_mut() {
+                let write_start = Instant::now();
                 if let Err(e) = write_frame_with_retry(stdin, &buffer).await {
                     error!("Failed to write frame to ffmpeg after max retries: {}", e);
                     break;
                 }
                 *frame_count += 1;
-                debug!("Wrote frame {} to FFmpeg", frame_count);
+                let enc_ms = enc_start.elapsed().as_millis();
+                let write_ms = write_start.elapsed().as_millis();
+                info!(
+                    "ffmpeg write: frame={} encode_ms={} write_ms={}",
+                    *frame_count, enc_ms, write_ms
+                );
 
                 flush_ffmpeg_input(stdin, *frame_count, fps).await;
             }
