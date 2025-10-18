@@ -482,7 +482,9 @@ impl ParallelProcessor {
                     task.frame_id, task.app_name, task.window_name
                 );
 
-                // Check if UI already exists for this frame to avoid duplicate snapshots
+                // Ensure column exists to avoid transient 'no such column' on fresh DBs
+                let _ = db.ensure_ui_monitoring_frame_id().await;
+                // Check by frame_id to guarantee one UI row per frame
                 match db.ui_monitoring_exists_for_frame(task.frame_id).await {
                     Ok(exists) if exists => {
                         let total_ms = start.elapsed().as_millis();
@@ -555,16 +557,15 @@ impl ParallelProcessor {
                 );
 
                 // Insert UI monitoring data
-                match db
-                    .upsert_ui_monitoring(
+                match db.upsert_ui_monitoring(
                         task.timestamp,
                         None,
                         &task.app_name,
                         &task.window_name,
                         &ax_text,
                         task.frame_id,
-                    )
-                    .await
+                )
+                .await
                 {
                     Ok(_) => {
                         let total_ms = start.elapsed().as_millis();

@@ -2,7 +2,7 @@ use chrono::Utc;
 use crossbeam::queue::ArrayQueue;
 use image::ImageFormat::{self};
 use screenpipe_core::{find_ffmpeg_path, Language};
-use screenpipe_vision::monitor::get_monitor_by_id;
+use screenpipe_vision::monitor::{get_monitor_by_id, resolve_preferred_monitor_id};
 use screenpipe_vision::{
     capture_screenshot_by_window::WindowFilters, continuous_capture, CaptureResult, OcrEngine,
 };
@@ -97,17 +97,31 @@ impl VideoCapture {
                         "Monitor {} is not available, waiting before starting capture",
                         monitor_id
                     );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
 
-                info!("Starting continuous_capture for monitor {}", monitor_id);
+                // Resolve a usable monitor id (Windows: try foreground-based mapping)
+                let resolved_monitor_id = match resolve_preferred_monitor_id(monitor_id).await {
+                    Some(id) => id,
+                    None => {
+                        warn!(
+                            "no monitors available to start capture, retrying shortly"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+
+                info!(
+                    "Starting continuous_capture for monitor {} (resolved from {})",
+                    resolved_monitor_id, monitor_id
+                );
 
                 match continuous_capture(
                     capture_result_sender.clone(),
                     capture_interval,
                     (*capture_ocr_engine).clone(),
-                    monitor_id,
+                    resolved_monitor_id,
                     capture_window_filters.clone(),
                     capture_languages.clone(),
                     capture_unfocused,
@@ -116,12 +130,24 @@ impl VideoCapture {
                 {
                     Ok(_) => warn!(
                         "continuous_capture task for monitor {} completed unexpectedly",
-                        monitor_id
+                        resolved_monitor_id
                     ),
-                    Err(e) => error!(
-                        "continuous_capture task for monitor {} failed with error: {}",
-                        monitor_id, e
-                    ),
+                    Err(e) => {
+                        #[cfg(target_os = "windows")]
+                        {
+                            // If the error indicates a monitor switch, immediately retry to resolve new id
+                            if format!("{}", e).contains("MonitorSwitched") {
+                                warn!(
+                                    "monitor switched detected; restarting capture with new focus monitor"
+                                );
+                                continue;
+                            }
+                        }
+                        error!(
+                            "continuous_capture task for monitor {} failed with error: {}",
+                            resolved_monitor_id, e
+                        )
+                    }
                 }
 
                 // If we get here, either the task completed or failed

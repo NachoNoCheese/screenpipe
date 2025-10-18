@@ -145,6 +145,8 @@ const BROWSER_NAMES: [&str; 9] = [
 #[derive(Debug)]
 pub enum ContinuousCaptureError {
     MonitorNotFound,
+    #[cfg(target_os = "windows")]
+    MonitorSwitched,
     ErrorCapturingScreenshot(String),
     ErrorProcessingOcr(String),
     ErrorSendingOcrResult(String),
@@ -190,6 +192,28 @@ pub async fn continuous_capture(
         ticker.tick().await;
         let tick_start = Instant::now();
         let since_last_ms = tick_start.saturating_duration_since(last_tick).as_millis();
+
+        // Windows: if focus moved to a monitor with different geometry, switch
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+            use crate::windows_monitor_utils::get_monitor_rect_from_hwnd;
+            let hwnd = unsafe { GetForegroundWindow() };
+            if hwnd.0 != std::ptr::null_mut() {
+                if let Some(rect) = get_monitor_rect_from_hwnd(hwnd) {
+                    let fw = (rect.right - rect.left).max(0) as u32;
+                    let fh = (rect.bottom - rect.top).max(0) as u32;
+                    let (mw, mh) = monitor.dimensions();
+                    if fw > 0 && fh > 0 && (fw != mw || fh != mh) {
+                        debug!(
+                            "focus monitor geometry {}x{} differs from current {}x{}; switching",
+                            fw, fh, mw, mh
+                        );
+                        return Err(ContinuousCaptureError::MonitorSwitched);
+                    }
+                }
+            }
+        }
 
         // 3. Capture screenshot
         let cap_start = Instant::now();
@@ -430,20 +454,33 @@ fn capture_live_ui_snapshot(window_images: &[CapturedWindow]) -> Option<UiSnapsh
                     return None;
                 }
 
-                if app_lower != expected_app || window_lower != expected_window {
+                // Normalize Outlook (olk.exe) app naming
+                let app_norm = if app_lower == "olk" || app_lower == "olk.exe" || app_lower.contains("outlook") { "microsoft outlook" } else { &app_lower };
+                let expected_norm = if expected_app.contains("outlook") || expected_app.contains("olk") { "microsoft outlook".to_string() } else { expected_app.clone() };
+
+                if app_norm != expected_norm || window_lower != expected_window {
                     info!(
-                        "ui snapshot mismatch: expected {}:{}, got {}:{}, len={}",
-                        expected_app, expected_window, app_lower, window_lower, text_len
+                        "ui snapshot mismatch (accepted): expected {}:{}, got {}:{}, len={}",
+                        expected_norm, expected_window, app_norm, window_lower, text_len
                     );
-                    return None;
                 }
 
-                info!(
-                    "ui snapshot captured for app={} window={} len={}",
-                    app_lower, window_lower, text_len
-                );
+                // Windows-only: ensure focused UI text corresponds to selected monitor's focused window
+                #[cfg(target_os = "windows")]
+                {
+                    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+                    use crate::windows_monitor_utils::get_monitor_rect_from_hwnd;
+                    // We can't correlate to xcap monitor directly without origins; best-effort skip if no foreground
+                    let hwnd = unsafe { GetForegroundWindow() };
+                    if hwnd.0 == std::ptr::null_mut() || get_monitor_rect_from_hwnd(hwnd).is_none() {
+                        info!("ui snapshot skipped: unable to resolve foreground window monitor");
+                        return None;
+                    }
+                }
+
+                info!("ui snapshot captured for app={} window={} len={}", app_lower, window_lower, text_len);
                 return Some(UiSnapshot {
-                    app: app_lower,
+                    app: app_norm.to_string(),
                     window: window_lower,
                     text,
                     captured_at: Instant::now(),

@@ -78,6 +78,12 @@ impl DatabaseManager {
         // Run migrations after establishing the connection
         Self::run_migrations(&db_manager.pool).await?;
 
+        // Ensure ui_monitoring has frame_id column and index for per-frame UI (idempotent)
+        let _ = db_manager.ensure_ui_monitoring_frame_id().await;
+
+        // Ensure per-frame UI table exists (idempotent)
+        let _ = db_manager.ensure_ui_monitoring_frames().await;
+
         Ok(db_manager)
     }
 
@@ -88,6 +94,76 @@ impl DatabaseManager {
             Ok(_) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Ensure per-frame UI table exists (Windows) without affecting macOS rolling table.
+    async fn ensure_ui_monitoring_frames(&self) -> Result<(), anyhow::Error> {
+        // Create table if not exists
+        let _ = sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ui_monitoring_frames (
+                frame_id INTEGER PRIMARY KEY,
+                timestamp TEXT,
+                initial_traversal_at TEXT,
+                app TEXT,
+                window TEXT,
+                text_output TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Indexes
+        let _ = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ui_frames_frame_id ON ui_monitoring_frames(frame_id)",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_ui_frames_app_window_ts ON ui_monitoring_frames(app, window, timestamp)",
+        )
+        .execute(&self.pool)
+        .await;
+
+        Ok(())
+    }
+
+    /// Ensure ui_monitoring.frame_id column and unique index exist (idempotent).
+    pub async fn ensure_ui_monitoring_frame_id(&self) -> Result<(), anyhow::Error> {
+        let table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+
+        if !table_exists {
+            return Ok(());
+        }
+
+        let has_frame_id = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM pragma_table_info('ui_monitoring') WHERE name='frame_id'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+
+        if !has_frame_id {
+            let _ = sqlx::query("ALTER TABLE ui_monitoring ADD COLUMN frame_id INTEGER")
+                .execute(&self.pool)
+                .await;
+        }
+
+        let _ = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ui_monitoring_frame_id ON ui_monitoring(frame_id)",
+        )
+        .execute(&self.pool)
+        .await;
+
+        Ok(())
     }
 
     pub async fn insert_audio_chunk(&self, file_path: &str) -> Result<i64, sqlx::Error> {
@@ -397,50 +473,15 @@ impl DatabaseManager {
         text_output: &str,
         frame_id: i64,
     ) -> Result<(), anyhow::Error> {
-        // Gracefully skip if table is absent
-        let table_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0)
-            > 0;
-
-        if !table_exists {
-            return Ok(());
-        }
-
-        // Ensure frame_id column exists (one-time migration)
-        let has_frame_id = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(1) FROM pragma_table_info('ui_monitoring') WHERE name='frame_id'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0)
-            > 0;
-
-        if !has_frame_id {
-            let _ = sqlx::query("ALTER TABLE ui_monitoring ADD COLUMN frame_id INTEGER")
-                .execute(&self.pool)
-                .await;
-        }
-
-        // Ensure unique index on frame_id so we have at most one UI row per frame
-        let _ = sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ui_monitoring_frame_id ON ui_monitoring(frame_id)"
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Upsert by frame_id to guarantee one UI row per captured frame
+        // Prefer writing per-frame rows into ui_monitoring_frames (Windows), idempotent upsert by frame_id
         let result = sqlx::query(
             r#"
-            INSERT INTO ui_monitoring (timestamp, initial_traversal_at, app, window, text_output, frame_id)
+            INSERT INTO ui_monitoring_frames (timestamp, initial_traversal_at, app, window, text_output, frame_id)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(frame_id) DO UPDATE SET
                 timestamp = excluded.timestamp,
                 text_output = excluded.text_output,
-                initial_traversal_at = COALESCE(ui_monitoring.initial_traversal_at, excluded.initial_traversal_at),
+                initial_traversal_at = COALESCE(ui_monitoring_frames.initial_traversal_at, excluded.initial_traversal_at),
                 app = excluded.app,
                 window = excluded.window
             "#,
@@ -460,14 +501,14 @@ impl DatabaseManager {
         }
     }
 
-    /// Check if a UI monitoring row already exists for a given frame_id
+    /// Check if a per-frame UI monitoring row already exists for a given frame_id.
     pub async fn ui_monitoring_exists_for_frame(
         &self,
         frame_id: i64,
     ) -> Result<bool, anyhow::Error> {
         // Return false if table doesn't exist
         let table_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
+            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring_frames'",
         )
         .fetch_one(&self.pool)
         .await
@@ -478,11 +519,12 @@ impl DatabaseManager {
             return Ok(false);
         }
 
-        let exists: Option<(i64,)> =
-            sqlx::query_as("SELECT 1 FROM ui_monitoring WHERE frame_id = ?1 LIMIT 1")
-                .bind(frame_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let exists: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM ui_monitoring_frames WHERE frame_id = ?1 LIMIT 1",
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(exists.is_some())
     }
 
@@ -492,20 +534,40 @@ impl DatabaseManager {
         app_name: &str,
         window_name: &str,
     ) -> Result<Option<String>, anyhow::Error> {
-        // Return None if table doesn't exist
-        let table_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
+        // Prefer per-frame table (should exist on Windows), fallback to rolling table (macOS)
+        let frames_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring_frames'",
         )
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0)
             > 0;
 
-        if !table_exists {
+        if frames_exists {
+            let res: Option<(String,)> = sqlx::query_as(
+                r#"SELECT text_output FROM ui_monitoring_frames WHERE app = ?1 AND window = ?2 ORDER BY timestamp DESC LIMIT 1"#,
+            )
+            .bind(app_name)
+            .bind(window_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            if res.is_some() {
+                return Ok(res.map(|t| t.0));
+            }
+        }
+
+        let rolling_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+        if !rolling_exists {
             return Ok(None);
         }
 
-        let res: Option<(String,)> = sqlx::query_as(
+        let res2: Option<(String,)> = sqlx::query_as(
             r#"SELECT text_output FROM ui_monitoring WHERE app = ?1 AND window = ?2 ORDER BY timestamp DESC LIMIT 1"#,
         )
         .bind(app_name)
@@ -513,7 +575,7 @@ impl DatabaseManager {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(res.map(|t| t.0))
+        Ok(res2.map(|t| t.0))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1259,25 +1321,43 @@ impl DatabaseManager {
                     "ocr_text_fts MATCH ?1"
                 }
             ),
-            ContentType::UI => format!(
-                r#"SELECT COUNT(DISTINCT ui_monitoring.id)
-                   FROM {table}
-                   WHERE {match_condition}
-                       AND (?2 IS NULL OR timestamp >= ?2)
-                       AND (?3 IS NULL OR timestamp <= ?3)
-                       AND (?4 IS NULL OR COALESCE(text_length, LENGTH(ui_monitoring.text_output)) >= ?4)
-                       AND (?5 IS NULL OR COALESCE(text_length, LENGTH(ui_monitoring.text_output)) <= ?5)"#,
-                table = if ui_query.is_empty() {
-                    "ui_monitoring"
-                } else {
-                    "ui_monitoring_fts JOIN ui_monitoring ON ui_monitoring_fts.ui_id = ui_monitoring.id"
-                },
-                match_condition = if ui_query.is_empty() {
-                    "1=1"
-                } else {
-                    "ui_monitoring_fts MATCH ?1"
+            ContentType::UI => {
+                #[cfg(target_os = "windows")]
+                {
+                    // Count rows from ui_monitoring_frames on Windows
+                    format!(
+                        r#"SELECT COUNT(*)
+                           FROM ui_monitoring_frames
+                           WHERE 1=1
+                               AND (?1 IS NULL OR timestamp >= ?1)
+                               AND (?2 IS NULL OR timestamp <= ?2)
+                               AND (?3 IS NULL OR LENGTH(text_output) >= ?3)
+                               AND (?4 IS NULL OR LENGTH(text_output) <= ?4)"#
+                    )
                 }
-            ),
+                #[cfg(not(target_os = "windows"))]
+                {
+                    format!(
+                        r#"SELECT COUNT(DISTINCT ui_monitoring.id)
+                           FROM {table}
+                           WHERE {match_condition}
+                               AND (?2 IS NULL OR timestamp >= ?2)
+                               AND (?3 IS NULL OR timestamp <= ?3)
+                               AND (?4 IS NULL OR COALESCE(text_length, LENGTH(ui_monitoring.text_output)) >= ?4)
+                               AND (?5 IS NULL OR COALESCE(text_length, LENGTH(ui_monitoring.text_output)) <= ?5)"#,
+                        table = if ui_query.is_empty() {
+                            "ui_monitoring"
+                        } else {
+                            "ui_monitoring_fts JOIN ui_monitoring ON ui_monitoring_fts.ui_id = ui_monitoring.id"
+                        },
+                        match_condition = if ui_query.is_empty() {
+                            "1=1"
+                        } else {
+                            "ui_monitoring_fts MATCH ?1"
+                        }
+                    )
+                }
+            }
             ContentType::Audio => format!(
                 r#"SELECT COUNT(DISTINCT audio_transcriptions.id)
                    FROM {table}
@@ -1730,6 +1810,24 @@ impl DatabaseManager {
         browser_url: Option<&str>,
         focused: Option<bool>,
     ) -> Result<Vec<UiContent>, sqlx::Error> {
+        // On Windows builds, prefer the per-frame table ui_monitoring_frames
+        #[cfg(target_os = "windows")]
+        {
+            return self
+                .search_ui_monitoring_windows(
+                    query,
+                    app_name,
+                    window_name,
+                    start_time,
+                    end_time,
+                    limit,
+                    offset,
+                    browser_url,
+                    focused,
+                )
+                .await;
+        }
+
         // combine search aspects into single fts query
         let mut fts_parts = Vec::new();
         if !query.is_empty() {
@@ -1813,6 +1911,91 @@ impl DatabaseManager {
             .bind(focused)
             .fetch_all(&self.pool)
             .await
+    }
+
+    // Windows-specific: query from ui_monitoring_frames (per-frame UI)
+    #[cfg(target_os = "windows")]
+    async fn search_ui_monitoring_windows(
+        &self,
+        query: &str,
+        app_name: Option<&str>,
+        window_name: Option<&str>,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        limit: u32,
+        offset: u32,
+        browser_url: Option<&str>,
+        focused: Option<bool>,
+    ) -> Result<Vec<UiContent>, sqlx::Error> {
+        // Build SQL with unnumbered positional placeholders to avoid index mismatch
+        let mut sql = String::from(
+            r#"SELECT
+                ui_monitoring_frames.frame_id AS id,
+                ui_monitoring_frames.text_output,
+                ui_monitoring_frames.timestamp,
+                ui_monitoring_frames.app AS app_name,
+                ui_monitoring_frames.window AS window_name,
+                ui_monitoring_frames.initial_traversal_at,
+                video_chunks.file_path,
+                frames.offset_index,
+                frames.name AS frame_name,
+                frames.browser_url
+            FROM ui_monitoring_frames
+            LEFT JOIN frames ON frames.id = ui_monitoring_frames.frame_id
+            LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
+            WHERE 1=1
+                AND ui_monitoring_frames.frame_id IS NOT NULL
+                AND ui_monitoring_frames.text_output IS NOT NULL
+                AND LENGTH(ui_monitoring_frames.text_output) > 0"#,
+        );
+
+        // Time filters
+        if start_time.is_some() {
+            sql.push_str(" AND ui_monitoring_frames.timestamp >= ?");
+        }
+        if end_time.is_some() {
+            sql.push_str(" AND ui_monitoring_frames.timestamp <= ?");
+        }
+
+        // Browser URL LIKE filter
+        if browser_url.is_some() {
+            sql.push_str(" AND frames.browser_url LIKE ?");
+        }
+
+        // Focused filter
+        if focused.is_some() {
+            sql.push_str(" AND frames.focused = ?");
+        }
+
+        // Text contains filter
+        if !query.is_empty() {
+            sql.push_str(" AND ui_monitoring_frames.text_output LIKE ?");
+        }
+
+        // App/window filters (case-insensitive)
+        if app_name.is_some() {
+            sql.push_str(" AND lower(ui_monitoring_frames.app) = lower(?)");
+        }
+        if window_name.is_some() {
+            sql.push_str(" AND lower(ui_monitoring_frames.window) = lower(?)");
+        }
+
+        // Group/order and pagination
+        sql.push_str(" GROUP BY ui_monitoring_frames.frame_id ORDER BY ui_monitoring_frames.timestamp DESC LIMIT ? OFFSET ?");
+
+        // Build query and bind in exact order
+        let mut q = sqlx::query_as::<_, UiContent>(&sql);
+
+        if let Some(v) = start_time { q = q.bind(v); }
+        if let Some(v) = end_time { q = q.bind(v); }
+        if let Some(v) = browser_url { q = q.bind(format!("%{}%", v)); }
+        if let Some(v) = focused { q = q.bind(v); }
+        if !query.is_empty() { q = q.bind(format!("%{}%", query)); }
+        if let Some(v) = app_name { q = q.bind(v); }
+        if let Some(v) = window_name { q = q.bind(v); }
+        q = q.bind(limit).bind(offset);
+
+        q.fetch_all(&self.pool).await
     }
 
     // Add tags to UI monitoring entry

@@ -257,8 +257,12 @@ export function createDefaultSettingsObject(): Settings {
 					? "windows-native"
 					: "tesseract";
 
-		defaultSettings.ocrEngine = ocrModel;
-		defaultSettings.fps = currentPlatform === "macos" ? 0.5 : 1;
+    defaultSettings.ocrEngine = ocrModel;
+    defaultSettings.fps = 0.5;
+    // enable ui monitoring by default on windows so accessibility shows up
+    if (currentPlatform === "windows") {
+      defaultSettings.enableUiMonitoring = true;
+    }
 		defaultSettings.platform = currentPlatform;
 
 		defaultSettings.ignoredWindows = [

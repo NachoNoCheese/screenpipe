@@ -21,12 +21,15 @@ import { cn } from "@/lib/utils";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useStatusDialog } from "@/lib/hooks/use-status-dialog";
 import { PermissionButtons } from "./status/permission-buttons";
+import { Switch } from "@/components/ui/switch";
+import { invoke } from "@tauri-apps/api/core";
 
 const HealthStatus = ({ className }: { className?: string }) => {
   const { health } = useHealthCheck();
   const { isOpen, open, close } = useStatusDialog();
-  const { settings, getDataDir } = useSettings();
+  const { settings, getDataDir, updateSettings } = useSettings();
   const [localDataDir, setLocalDataDir] = useState("");
+  const [togglingMic, setTogglingMic] = useState(false);
 
   const handleOpenDataDir = async () => {
     try {
@@ -103,6 +106,25 @@ const HealthStatus = ({ className }: { className?: string }) => {
     settings.disableAudio ?? "",
     settings.enableUiMonitoring
   );
+
+  const handleMicToggle = async (enabled: boolean) => {
+    try {
+      setTogglingMic(true);
+      // update setting: we store disableAudio
+      // enabled=true -> disableAudio=false
+      const disable = !enabled;
+      // optimistic UI update via settings store
+      updateSettings({ disableAudio: disable } as any);
+      // restart sidecar to apply
+      await invoke("stop_screenpipe");
+      await new Promise((r) => setTimeout(r, 800));
+      await invoke("spawn_screenpipe");
+    } catch (e) {
+      console.error("failed to toggle microphone:", e);
+    } finally {
+      setTogglingMic(false);
+    }
+  };
 
   const handleOpenStatusDialog = async () => {
     try {
@@ -208,7 +230,16 @@ const HealthStatus = ({ className }: { className?: string }) => {
                       : formatTimestamp(health?.last_audio_timestamp ?? null)}
                   </span>
                 </div>
-                <div className="flex-shrink-0">
+                <div className="flex items-center gap-3 flex-shrink-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">mic</span>
+                    <Switch
+                      id="mic-toggle"
+                      checked={!settings.disableAudio}
+                      onCheckedChange={(checked) => handleMicToggle(checked)}
+                      disabled={togglingMic}
+                    />
+                  </div>
                   <PermissionButtons type="audio" />
                 </div>
               </div>

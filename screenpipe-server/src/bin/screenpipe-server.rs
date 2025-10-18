@@ -129,7 +129,10 @@ fn setup_logging(local_data_dir: &PathBuf, cli: &Cli) -> anyhow::Result<WorkerGu
             });
 
         if cli.debug {
-            filter.add_directive("screenpipe=debug".parse().unwrap())
+            filter
+                .add_directive("screenpipe=debug".parse().unwrap())
+                .add_directive("screenpipe_vision=debug".parse().unwrap())
+                .add_directive("screenpipe_core=debug".parse().unwrap())
         } else {
             filter
         }

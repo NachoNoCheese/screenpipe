@@ -7,7 +7,7 @@ use screenpipe_core::Language;
 use screenpipe_db::{DatabaseManager, Speaker};
 use screenpipe_events::{poll_meetings_events, send_event};
 use screenpipe_vision::core::WindowOcr;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use screenpipe_vision::get_live_accessibility_text;
 use screenpipe_vision::OcrEngine;
 use std::sync::Arc;
@@ -511,12 +511,9 @@ async fn record_video(
                         };
 
                         let insert_ui = async {
-                            // skip if ui already exists for this frame to avoid duplicate snapshots
-                            if db
-                                .ui_monitoring_exists_for_frame(frame_id)
-                                .await
-                                .unwrap_or(false)
-                            {
+                        // Ensure column exists, then skip if ui already exists for this frame
+                        let _ = db.ensure_ui_monitoring_frame_id().await;
+                        if db.ui_monitoring_exists_for_frame(frame_id).await.unwrap_or(false) {
                                 info!("ui_upsert_skip: frame_id={} already has ui row", frame_id);
                                 return;
                             }
@@ -556,15 +553,14 @@ async fn record_video(
                                     .unwrap_or_else(|| best_text_owned.clone())
                             };
 
-                            match db
-                                .upsert_ui_monitoring(
-                                    ts_wallclock,
-                                    None,
-                                    &appn,
-                                    &winn,
-                                    &ax_text,
-                                    frame_id,
-                                )
+                            match db.upsert_ui_monitoring(
+                                ts_wallclock,
+                                None,
+                                &appn,
+                                &winn,
+                                &ax_text,
+                                frame_id,
+                            )
                                 .await
                             {
                                 // TEMP: remove
@@ -606,18 +602,6 @@ async fn record_video(
                 if let Ok(frame_id) = result {
                     if frame_id > 0 {
                         // 2) Live AX snapshot and single UI upsert for this frame
-                        // skip if ui already exists for this frame to avoid duplicate snapshots
-                        if db
-                            .ui_monitoring_exists_for_frame(frame_id)
-                            .await
-                            .unwrap_or(false)
-                        {
-                            info!(
-                                "ui_upsert_skip(no-ocr): frame_id={} already has ui row",
-                                frame_id
-                            );
-                            continue;
-                        }
                         let ts_wallclock = frame_wallclock;
                         #[cfg(any(target_os = "macos", target_os = "windows"))]
                         let live_ax = screenpipe_vision::get_live_accessibility_text();
@@ -635,15 +619,27 @@ async fn record_video(
                             ),
                         };
 
-                        match db
-                            .upsert_ui_monitoring(
-                                ts_wallclock,
-                                None,
-                                &appn,
-                                &winn,
-                                &ax_text,
-                                frame_id,
-                            )
+                        // Align with macOS: skip if (app, window) already has a row
+                        if db
+                            .ui_monitoring_exists_for_frame(frame_id)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            info!(
+                                "ui_upsert_skip(no-ocr): frame_id={} already has ui row",
+                                frame_id
+                            );
+                            continue;
+                        }
+
+                        match db.upsert_ui_monitoring(
+                            ts_wallclock,
+                            None,
+                            &appn,
+                            &winn,
+                            &ax_text,
+                            frame_id,
+                        )
                             .await
                         {
                             // TEMP: remove

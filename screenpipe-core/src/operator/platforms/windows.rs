@@ -16,6 +16,7 @@ use uiautomation::patterns;
 use uiautomation::types::{Point, PropertyConditionFlags, ScrollAmount, TreeScope, UIProperty};
 use uiautomation::variants::Variant;
 use uiautomation::UIAutomation;
+use std::process::Command;
 
 // thread-safety
 #[derive(Clone)]
@@ -566,10 +567,25 @@ impl UIElementImpl for WindowsUIElement {
     }
 
     fn children(&self) -> Result<Vec<UIElement>, AutomationError> {
+        // Prefer non-cached children to avoid empty results without prior cache request
+        let automation = WindowsEngine::new(false, false)
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+        let true_condition = automation
+            .automation
+            .0
+            .create_true_condition()
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
         let children = self
             .element
             .0
-            .get_cached_children()
+            .find_all(TreeScope::Children, &true_condition)
+            .or_else(|_| {
+                // Fallback to cached children if find_all fails
+                self.element
+                    .0
+                    .get_cached_children()
+                    .map_err(|e| AutomationError::ElementNotFound(e.to_string()))
+            })
             .map_err(|e| AutomationError::ElementNotFound(e.to_string()))?;
         Ok(children
             .into_iter()
@@ -582,16 +598,26 @@ impl UIElementImpl for WindowsUIElement {
     }
 
     fn parent(&self) -> Result<Option<UIElement>, AutomationError> {
-        let parent = self.element.0.get_cached_parent();
-        match parent {
-            Ok(par) => {
+        // Try direct parent; if not cached, attempt via TreeWalker as fallback
+        if let Ok(par) = self.element.0.get_cached_parent() {
+            let par_ele = UIElement::new(Box::new(WindowsUIElement {
+                element: ThreadSafeWinUIElement(Arc::new(par)),
+            }));
+            return Ok(Some(par_ele));
+        }
+
+        let automation = WindowsEngine::new(false, false)
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?;
+        if let Ok(walker) = automation.automation.0.get_control_view_walker() {
+            if let Ok(par) = walker.get_parent(&self.element.0) {
                 let par_ele = UIElement::new(Box::new(WindowsUIElement {
                     element: ThreadSafeWinUIElement(Arc::new(par)),
                 }));
-                Ok(Some(par_ele))
+                return Ok(Some(par_ele));
             }
-            Err(e) => Err(AutomationError::ElementNotFound(e.to_string())),
         }
+
+        Ok(None)
     }
 
     fn bounds(&self) -> Result<(f64, f64, f64, f64), AutomationError> {
@@ -764,9 +790,10 @@ impl UIElementImpl for WindowsUIElement {
     fn get_text(&self, max_depth: usize) -> Result<String, AutomationError> {
         let mut all_texts = Vec::new();
 
-        // Create a function to extract text recursively
+        // Create a function to extract text recursively (non-cached children preferred)
         fn extract_text_from_element(
             element: &uiautomation::UIElement,
+            automation: &UIAutomation,
             texts: &mut Vec<String>,
             current_depth: usize,
             max_depth: usize,
@@ -793,10 +820,16 @@ impl UIElementImpl for WindowsUIElement {
                 }
             }
 
-            // Recursively process children
-            if let Ok(children) = element.get_cached_children() {
-                for child in children {
-                    let _ = extract_text_from_element(&child, texts, current_depth + 1, max_depth);
+            // Recursively process children using non-cached traversal
+            if let Ok(true_cond) = automation.create_true_condition() {
+                if let Ok(children) = element.find_all(TreeScope::Children, &true_cond) {
+                    for child in children {
+                        let _ = extract_text_from_element(&child, automation, texts, current_depth + 1, max_depth);
+                    }
+                } else if let Ok(children) = element.get_cached_children() {
+                    for child in children {
+                        let _ = extract_text_from_element(&child, automation, texts, current_depth + 1, max_depth);
+                    }
                 }
             }
 
@@ -804,7 +837,11 @@ impl UIElementImpl for WindowsUIElement {
         }
 
         // Extract text from the element and its descendants
-        extract_text_from_element(&self.element.0, &mut all_texts, 0, max_depth)?;
+        let automation = WindowsEngine::new(false, false)
+            .map_err(|e| AutomationError::PlatformError(e.to_string()))?
+            .automation
+            .0;
+        extract_text_from_element(&self.element.0, &automation, &mut all_texts, 0, max_depth)?;
 
         // Join the texts with spaces
         Ok(all_texts.join(" "))
@@ -1040,6 +1077,25 @@ fn get_pid_by_name(name: &str) -> Option<i32> {
         // return only parent pid
         let pid_str = String::from_utf8_lossy(&output.stdout);
         pid_str.lines().next()?.trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+pub fn get_process_name(pid: u32) -> Option<String> {
+    let command = format!(
+        "Get-Process -Id {} | Select-Object -ExpandProperty ProcessName",
+        pid
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "hidden", "-Command", &command])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let name = String::from_utf8_lossy(&output.stdout);
+        Some(name.trim().to_string())
     } else {
         None
     }

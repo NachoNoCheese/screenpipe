@@ -327,13 +327,8 @@ if (platform == 'windows') {
 		// process.exit(1);
 	}
 
-	// Setup FFMPEG
-	if (!(await fs.exists(config.ffmpegRealname))) {
-		await $`${wgetPath} --no-config --tries=10 --retry-connrefused --waitretry=10 --secure-protocol=auto --no-check-certificate --show-progress ${config.windows.ffmpegUrl} -O ${config.windows.ffmpegName}.7z`
-		await $`'C:\\Program Files\\7-Zip\\7z.exe' x ${config.windows.ffmpegName}.7z`
-		await $`mv ${config.windows.ffmpegName} ${config.ffmpegRealname}`
-		await $`rm -rf ${config.windows.ffmpegName}.7z`
-	}
+	// Setup FFMPEG - Skip download since FFmpeg is installed via winget
+	console.log('Skipping FFmpeg download - using system-installed FFmpeg via winget');
 
 	// Setup vcpkg packages with environment variables set inline
 	// TODO is this even used? dont we use build.rs for this?

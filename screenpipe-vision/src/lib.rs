@@ -30,3 +30,7 @@ pub mod live_ax;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use live_ax::get_live_accessibility_text;
+
+// Windows-only monitor/window helpers
+#[cfg(target_os = "windows")]
+pub mod windows_monitor_utils;

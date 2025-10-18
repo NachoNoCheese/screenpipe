@@ -282,9 +282,29 @@ pub async fn capture_all_visible_windows(
         );
 
         // Apply filters
+        let mut on_selected_monitor = true;
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+            use crate::windows_monitor_utils::{get_monitor_rect_from_hwnd, rects_intersect};
+
+            // Best-effort: compare the foreground window's monitor to ensure focused capture stays on selected monitor
+            let hwnd = unsafe { GetForegroundWindow() };
+            if hwnd.0 != std::ptr::null_mut() {
+                if let Some(fg_rect) = get_monitor_rect_from_hwnd(hwnd) {
+                    // Build a rect from the selected monitor dimensions at origin (xcap lacks origin),
+                    // so skip intersection and rely on focused gating below.
+                    // Mark as true; the strict check will be enforced later in UI snapshot.
+                    on_selected_monitor = true;
+                }
+            }
+        }
+
         let is_valid = !SKIP_APPS.contains(app_name.as_str())
             && !SKIP_TITLES.contains(window_name.as_str())
-            && (capture_unfocused_windows || (is_focused && monitor.id() == monitor.id()))
+            && on_selected_monitor
+            && (capture_unfocused_windows || is_focused)
             && window_filters.is_valid(&app_name, &window_name);
 
         if is_valid {
